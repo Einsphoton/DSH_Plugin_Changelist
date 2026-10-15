@@ -1,0 +1,36 @@
+{
+  "name": "@local/dsh-changelist",
+  "version": "0.1.0",
+  "private": true,
+  "description": "工作区改动面板：显示当前工作区相对远端分支的全部文件改动与代码对比",
+  "type": "module",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "lib/git.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar"
+      ]
+    }
+  },
+  "scripts": {
+    "test": "node selftest.mjs && node host-test.mjs && node client-test.mjs",
+    "test:integration": "node integration-test.mjs"
+  },
+  "license": "MIT"
+}

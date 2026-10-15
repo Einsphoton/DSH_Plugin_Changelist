@@ -1,0 +1,871 @@
+/**
+ * Browser half of the workspace-changelist plugin.
+ *
+ * Two surfaces, one store:
+ *   - a compact **chip** in the session header's top-right utilities that shows
+ *     the current workspace's change count and added/deleted lines;
+ *   - a **floating summary** in the shell overlay layer, opened by the chip,
+ *     listing the changed files and showing one file's comparison.
+ *
+ * Plain-JS ModuleLoader lane: no bundler, no Harness Client package imports.
+ * Styling uses only `--dsw-alias-*` theme tokens (with literal fallbacks) and
+ * one `<style>` tag owned by this plugin's effect.
+ */
+window.__ModuleLoader__.load({
+  id: '@local/dsh-changelist',
+  factory(require) {
+    const React = require('react')
+    const h = React.createElement
+
+    const NS = 'dsh-changelist'
+    const CHIP_ID = 'changelist.chip'
+    const POPOVER_ID = 'changelist.popover'
+    // v2: the first version remembered a directory that could then outrank the
+    // session the chip was rendered in, so that memory is deliberately dropped.
+    const STORAGE_KEY = 'dsh-changelist.dir.v2'
+    const BASE = 'api/changelist'
+    const MAX_RENDER_LINES = 3000
+
+    const zh = {
+      panel: '工作区改动',
+      summary: '置顶摘要',
+      refresh: '刷新',
+      fetchRemote: '拉取远端',
+      close: '关闭',
+      wrapping: '自动换行',
+      noWrap: '不换行',
+      loading: '正在读取改动…',
+      loadingDiff: '正在读取对比…',
+      clean: '工作区干净',
+      cleanAgainst: '与 {base} 无差异',
+      notRepo: '该目录不是 git 工作区',
+      notRepoChip: '非 git 工作区',
+      noTargets: '还没有可用的工作区或会话目录',
+      files: '{count} 个文件',
+      shortFiles: '{count} 个文件',
+      ahead: '领先 {count}',
+      behind: '落后 {count}',
+      untracked: '未跟踪',
+      binary: '二进制',
+      truncated: '内容过长，仅显示前 {count} 行',
+      missing: '这轮改动的内容已不可用',
+      createdAt: '新建',
+      deletedAt: '删除',
+      unchanged: '两侧内容相同',
+      added: '新增',
+      deleted: '删除',
+      chooseFile: '点击左侧文件查看代码改动',
+      fetchOk: '已拉取 {remote}',
+      fetchFailed: '拉取 {remote} 失败：{message}',
+      allowed: '可用的目录：',
+      error: '读取失败：{message}',
+      hint: '点击查看工作区改动',
+      directory: '目录',
+      notRepoHint: '这里是当前会话的工作目录；若它还没有版本库，可在终端里执行 git init。',
+      oldHost: 'Host 半边版本较旧：已改用目录方式读取。重启 DSH 可加载新版 Host 半边。',
+    }
+    const en = {
+      panel: 'Workspace changes',
+      summary: 'Pinned summary',
+      refresh: 'Refresh',
+      fetchRemote: 'Fetch remote',
+      close: 'Close',
+      wrapping: 'Wrap lines',
+      noWrap: 'No wrap',
+      loading: 'Reading changes…',
+      loadingDiff: 'Reading comparison…',
+      clean: 'Working tree clean',
+      cleanAgainst: 'No differences against {base}',
+      notRepo: 'Not a git working tree',
+      notRepoChip: 'No git repo',
+      noTargets: 'No usable workspace or session directory yet',
+      files: '{count} files',
+      shortFiles: '{count} files',
+      ahead: '{count} ahead',
+      behind: '{count} behind',
+      untracked: 'untracked',
+      binary: 'binary',
+      truncated: 'Showing the first {count} lines',
+      missing: 'This comparison is no longer available',
+      createdAt: 'created',
+      deletedAt: 'deleted',
+      unchanged: 'Both sides hold the same lines',
+      added: 'added',
+      deleted: 'deleted',
+      chooseFile: 'Choose a file on the left to see its code changes',
+      fetchOk: 'Fetched {remote}',
+      fetchFailed: 'Fetching {remote} failed: {message}',
+      allowed: 'Available directories: ',
+      error: 'Read failed: {message}',
+      hint: 'Open the workspace changelist',
+      directory: 'Directory',
+      notRepoHint: 'This is the current session’s working directory; run git init there if it has no repository yet.',
+      oldHost: 'Older Host half: reading by directory instead. Restart DSH to load the current Host half.',
+    }
+
+    const css = [
+      '.dshCl_root{min-width:0}',
+      /* ── the chip in the session header ─────────────────────────────── */
+      '.dshCl_chip{display:inline-flex;align-items:center;gap:6px;height:28px;max-width:230px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:1;cursor:pointer;white-space:nowrap;overflow:hidden}',
+      '.dshCl_chip:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshCl_chip[data-open=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshCl_dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-state-warn-primary,#bf8700)}',
+      '.dshCl_dot[data-state=clean]{background:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshCl_dot[data-state=error]{background:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshCl_dot[data-state=loading]{background:var(--dsw-alias-label-tertiary)}',
+      '.dshCl_dot[data-state=norepo]{background:var(--dsw-alias-label-tertiary);box-shadow:none}',
+      '.dshCl_chipText{min-width:0;overflow:hidden;text-overflow:ellipsis;font-family:var(--ds-font-family-code)}',
+      '.dshCl_chipAdd{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshCl_chipDel{color:var(--dsw-alias-state-error-primary,#e03131)}',
+      /* ── the floating summary ───────────────────────────────────────── */
+      '.dshCl_pop{position:absolute;top:56px;right:14px;z-index:21;display:flex;flex-direction:column;width:min(620px,94vw);max-height:min(74vh,660px);pointer-events:auto;border:.5px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));color:var(--dsw-alias-label-primary);box-shadow:0 12px 32px rgba(0,0,0,.18);overflow:hidden;font-size:13px}',
+      '.dshCl_head{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3)}',
+      '.dshCl_title{flex:none;margin:0;font-size:13px;font-weight:600}',
+      '.dshCl_meta{flex:1;min-width:0;display:flex;align-items:center;gap:8px;color:var(--dsw-alias-label-tertiary);font-size:12px;font-family:var(--ds-font-family-code);overflow:hidden;white-space:nowrap}',
+      '.dshCl_btn{flex:none;height:26px;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3);border-radius:7px;background:transparent;color:inherit;font:inherit;font-size:12px;cursor:pointer}',
+      '.dshCl_btn:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshCl_btn[disabled]{opacity:.45;cursor:default}',
+      '.dshCl_iconBtn{flex:none;width:26px;height:26px;display:inline-flex;align-items:center;justify-content:center;border:none;border-radius:7px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:15px;line-height:1;cursor:pointer}',
+      '.dshCl_iconBtn:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshCl_body{flex:1;min-height:0;display:flex;flex-direction:column}',
+      '.dshCl_picker{flex:none;display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3)}',
+      '.dshCl_select{flex:1;min-width:0;height:26px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3);border-radius:7px;background:var(--dsw-alias-bg-l1);color:inherit;font:inherit;font-size:12px}',
+      '.dshCl_list{flex:none;min-height:0;overflow:auto;max-height:34%;padding:6px;border-bottom:.5px solid var(--dsw-alias-border-l3)}',
+      '.dshCl_listFull{max-height:100%;border-bottom:none}',
+      '.dshCl_row{display:flex;align-items:center;gap:8px;width:100%;padding:4px 8px;border:none;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
+      '.dshCl_row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshCl_rowActive{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshCl_status{flex:none;width:13px;text-align:center;font-family:var(--ds-font-family-code);font-size:11px;font-weight:700}',
+      '.dshCl_sM{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
+      '.dshCl_sA{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshCl_sD{color:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshCl_sR{color:var(--dsw-alias-state-business-primary,#4c6ef5)}',
+      '.dshCl_path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--ds-font-family-code);font-size:12px}',
+      '.dshCl_counts{flex:none;display:flex;gap:5px;font-family:var(--ds-font-family-code);font-size:11px}',
+      '.dshCl_add{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshCl_del{color:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshCl_diffWrap{flex:1;min-height:120px;display:flex;flex-direction:column;background:var(--dsw-alias-bg-l1)}',
+      '.dshCl_diffHead{flex:none;display:flex;align-items:center;gap:10px;padding:6px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3);font-family:var(--ds-font-family-code);font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.dshCl_diffBody{flex:1;min-height:0;overflow:auto}',
+      '.dshCl_pre{margin:0;padding:6px 0;font-family:var(--ds-font-family-code);font-size:12px;line-height:1.5}',
+      '.dshCl_line{display:block;padding:0 12px;white-space:pre}',
+      '.dshCl_wrap .dshCl_line{white-space:pre-wrap;overflow-wrap:anywhere}',
+      '.dshCl_addLine{background:var(--dsw-alias-file-diff-added-bg,rgba(47,158,68,.14))}',
+      '.dshCl_delLine{background:var(--dsw-alias-file-diff-deleted-bg,rgba(224,49,49,.14))}',
+      '.dshCl_hunk{color:var(--dsw-alias-state-business-primary,#4c6ef5)}',
+      '.dshCl_metaLine{color:var(--dsw-alias-label-tertiary)}',
+      '.dshCl_ctx{color:var(--dsw-alias-label-secondary)}',
+      '.dshCl_note{flex:none;max-height:96px;overflow:auto;padding:7px 12px;border-top:.5px solid var(--dsw-alias-border-l3);font-size:11px;color:var(--dsw-alias-state-warn-primary,#bf8700);white-space:pre-wrap}',
+      '.dshCl_error{color:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshCl_center{display:flex;align-items:center;justify-content:center;min-height:88px;padding:18px 12px;color:var(--dsw-alias-label-tertiary);text-align:center}',
+      '.dshCl_detail{margin-top:6px;font-family:var(--ds-font-family-code);font-size:11px;color:var(--dsw-alias-label-tertiary);white-space:pre-wrap;overflow-wrap:anywhere}',
+      '.dshCl_dir{flex:none;display:flex;align-items:center;gap:6px;padding:6px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+    ].join('')
+
+    const STATUS_CLASS = { M: 'dshCl_sM', A: 'dshCl_sA', D: 'dshCl_sD', R: 'dshCl_sR', C: 'dshCl_sR', T: 'dshCl_sM' }
+    const fallbackTranslator = (key) => String(key)
+
+    /** Classify one unified-diff line for colouring. Headers must beat the +/- prefixes. */
+    function lineKind(line) {
+      if (line.startsWith('@@')) return 'hunk'
+      if (
+        line.startsWith('diff ') ||
+        line.startsWith('index ') ||
+        line.startsWith('--- ') ||
+        line.startsWith('+++ ') ||
+        line.startsWith('new file') ||
+        line.startsWith('deleted file') ||
+        line.startsWith('similarity ') ||
+        line.startsWith('rename ') ||
+        line.startsWith('\\')
+      ) {
+        return 'meta'
+      }
+      if (line.startsWith('+')) return 'add'
+      if (line.startsWith('-')) return 'del'
+      return 'ctx'
+    }
+    const LINE_CLASS = { add: 'dshCl_addLine', del: 'dshCl_delLine', hunk: 'dshCl_hunk', meta: 'dshCl_metaLine', ctx: 'dshCl_ctx' }
+
+    /** Read one host route; a non-2xx answer becomes an Error carrying its message. */
+    async function requestJson(url, signal) {
+      const response = await fetch(url, { credentials: 'same-origin', signal })
+      let body = null
+      try {
+        body = await response.json()
+      } catch {
+        body = null
+      }
+      if (!response.ok || body === null) {
+        const error = new Error(body?.message || `HTTP ${response.status}`)
+        error.status = response.status
+        error.body = body
+        throw error
+      }
+      return body
+    }
+
+    const totalOf = (files) => {
+      let added = 0
+      let deleted = 0
+      let binary = 0
+      for (const file of files) {
+        if (typeof file.added === 'number') added += file.added
+        if (typeof file.deleted === 'number') deleted += file.deleted
+        if (file.binary) binary += 1
+      }
+      return { added, deleted, binary }
+    }
+
+    // ── one shared store for both surfaces ────────────────────────────────
+    const store = {
+      snapshot: {
+        open: false,
+        anchor: null,
+        targets: [],
+        target: null,
+        state: null,
+        phase: 'loading',
+        error: null,
+        selected: null,
+        diff: null,
+        diffPhase: 'idle',
+        busy: false,
+        notice: null,
+        hostCompat: null,
+        wrap: false,
+      },
+      listeners: new Set(),
+      get() {
+        return store.snapshot
+      },
+      set(patch) {
+        store.snapshot = { ...store.snapshot, ...patch }
+        for (const listener of [...store.listeners]) listener()
+      },
+      subscribe(listener) {
+        store.listeners.add(listener)
+        return () => store.listeners.delete(listener)
+      },
+    }
+
+    /** Subscribe one component to the shared store. */
+    function useStore() {
+      const [snapshot, setSnapshot] = React.useState(store.get())
+      React.useEffect(() => store.subscribe(() => setSnapshot(store.get())), [])
+      return snapshot
+    }
+
+    const remember = (dir) => {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, dir)
+      } catch {
+        /* private mode: the choice simply does not persist */
+      }
+    }
+    const remembered = () => {
+      try {
+        return window.localStorage.getItem(STORAGE_KEY)
+      } catch {
+        return null
+      }
+    }
+
+    /** The `sessionId` or `dir` query for the current target. */
+    function targetQuery(snapshot) {
+      const target = snapshot.target
+      if (!target) return null
+      return target.kind === 'session' ? { sessionId: target.id } : { dir: target.dir }
+    }
+
+    /**
+     * Ask the host for one resource. The current Host resolves a `sessionId`
+     * itself; an older Host — or one whose session lookup fails — only
+     * understands `dir`, so a rejected session request is retried once with the
+     * target's directory. That keeps a newer browser half working against an
+     * older host half instead of showing an error.
+     */
+    async function requestTarget(name, query, target, extra = {}) {
+      try {
+        const body = await requestJson(`${BASE}.${name}?${new URLSearchParams({ ...query, ...extra }).toString()}`)
+        return { body, viaDirectory: false }
+      } catch (cause) {
+        const retryable = cause?.status === 400 || cause?.status === 403 || cause?.status === 404
+        if (query.sessionId && target?.dir && retryable) {
+          const body = await requestJson(`${BASE}.${name}?${new URLSearchParams({ dir: target.dir, ...extra }).toString()}`)
+          return { body, viaDirectory: true }
+        }
+        throw cause
+      }
+    }
+
+    /**
+     * Measure the chip so the floating summary can hang under it, flipping above
+     * when the viewport leaves too little room below. A missing measurement
+     * leaves the CSS default placement in charge.
+     */
+    function measureAnchor(event) {
+      try {
+        const element = event?.currentTarget ?? event?.target
+        const rect = element?.getBoundingClientRect?.()
+        if (!rect || typeof rect.bottom !== 'number') return null
+        const viewportHeight = window.innerHeight || 0
+        const viewportWidth = window.innerWidth || 0
+        const right = Math.max(8, viewportWidth - rect.right)
+        const spaceBelow = viewportHeight - rect.bottom
+        if (viewportHeight > 0 && spaceBelow < 380) {
+          return { right, top: null, bottom: Math.max(8, viewportHeight - rect.top + 8) }
+        }
+        return { right, top: rect.bottom + 8, bottom: null }
+      } catch {
+        return null
+      }
+    }
+
+    // ── loading ───────────────────────────────────────────────────────────
+    let generation = 0
+
+    async function loadTargets() {
+      try {
+        const body = await requestJson(`${BASE}.targets`)
+        const targets = Array.isArray(body.targets) ? body.targets : []
+        store.set({ targets })
+        if (targets.length === 0 && store.get().target === null) {
+          store.set({ phase: 'empty', error: null })
+        }
+        return targets
+      } catch (cause) {
+        store.set({ phase: 'error', error: cause.message })
+        return []
+      }
+    }
+
+    async function loadState(options = {}) {
+      const snapshot = store.get()
+      const query = targetQuery(snapshot)
+      if (!query) return
+      const token = ++generation
+      store.set({ busy: true })
+      try {
+        const { body, viaDirectory } = await requestTarget(
+          'state',
+          query,
+          snapshot.target,
+          options.fetchRemote ? { fetch: '1', remote: options.remote ?? 'origin' } : {},
+        )
+        if (token !== generation) return
+        const files = Array.isArray(body.files) ? body.files : []
+        const selected =
+          snapshot.selected && files.some((file) => file.path === snapshot.selected)
+            ? snapshot.selected
+            : files.length > 0
+              ? files[0].path
+              : null
+        store.set({
+          state: body,
+          error: body.ok === false ? body.message ?? null : null,
+          phase: body.ok === false ? 'error' : files.length === 0 ? 'clean' : 'ready',
+          selected,
+          hostCompat: viaDirectory ? 'dir' : 'session',
+          notice: body.fetch
+            ? body.fetch.ok
+              ? options.t?.('fetchOk', { remote: body.fetch.remote }) ?? null
+              : options.t?.('fetchFailed', { remote: body.fetch.remote, message: body.fetch.message ?? '' }) ?? null
+            : store.get().notice,
+        })
+      } catch (cause) {
+        if (token !== generation) return
+        store.set({
+          phase: 'error',
+          error:
+            cause.status === 403 && cause.body?.allowed
+              ? `${cause.message}\n${cause.body.allowed.join('  ')}`
+              : cause.message,
+        })
+      } finally {
+        if (token === generation) store.set({ busy: false })
+      }
+    }
+
+    async function loadDiff(t) {
+      const snapshot = store.get()
+      const query = targetQuery(snapshot)
+      if (!query || !snapshot.selected) return
+      const token = generation
+      store.set({ diffPhase: 'loading' })
+      try {
+        const extra = { path: snapshot.selected }
+        if (snapshot.state?.base) extra.base = snapshot.state.base
+        const { body } = await requestTarget('diff', query, snapshot.target, extra)
+        if (token !== generation) return
+        store.set({ diff: body, diffPhase: 'ready' })
+      } catch (cause) {
+        if (token !== generation) return
+        store.set({
+          diff: { path: snapshot.selected, message: t('error', { message: cause.message }), text: '' },
+          diffPhase: 'error',
+        })
+      }
+    }
+
+    /** Point the store at one target and (re)load everything for it. */
+    function selectTarget(target, t, options = {}) {
+      if (!target) return
+      generation++
+      store.set({
+        target,
+        state: null,
+        diff: null,
+        diffPhase: 'idle',
+        selected: null,
+        phase: 'loading',
+        error: null,
+      })
+      if (target.kind !== 'session' && target.dir) remember(target.dir)
+      return loadState({ ...options, t }).then(() => loadDiff(t))
+    }
+
+    /** Pick a target: the session the chip lives in always outranks a remembered directory. */
+    function pickTarget(targets, sessionId) {
+      if (sessionId) {
+        const known = targets.find((target) => target.kind === 'session' && target.id === sessionId)
+        if (known) return known
+        // The session may be missing from the live list; the Host can still
+        // resolve it, so a synthetic target keeps the chip in the right project.
+        return { kind: 'session', id: sessionId, dir: '', title: '', live: true, sessions: null }
+      }
+      const rememberedDir = remembered()
+      if (rememberedDir) {
+        const match = targets.find((target) => target.dir === rememberedDir)
+        if (match) return match
+      }
+      return targets.find((target) => target.live) ?? targets[0] ?? null
+    }
+
+    /**
+     * The session the user is looking at, derived the way the shipped sidebar
+     * does it: the session retained by the main view.
+     */
+    function viewedSessionId(service) {
+      try {
+        const snapshot = service?.list?.getSnapshot?.()
+        for (const row of Object.values(snapshot?.byId ?? {})) {
+          if ((row?.retainedBy?.mainView ?? 0) > 0) return row.id ?? null
+        }
+        return null
+      } catch {
+        return null
+      }
+    }
+
+    /**
+     * Watch the viewed session. The store is not necessarily seeded when the
+     * chip first mounts (it may still be loading), so the chip must be able to
+     * follow the session once it appears — and when the user switches sessions
+     * in the same window, where the header does not remount.
+     */
+    function watchViewedSession(service, listener) {
+      try {
+        const subscribe = service?.list?.subscribe
+        if (typeof subscribe !== 'function') return () => {}
+        return subscribe.call(service.list, () => listener(viewedSessionId(service))) ?? (() => {})
+      } catch {
+        return () => {}
+      }
+    }
+
+    /** The identity a picker option carries, so a synthetic target stays selectable. */
+    const targetKey = (target) => (target.kind === 'session' ? `session:${target.id}` : `dir:${target.dir}`)
+
+    // ── views ─────────────────────────────────────────────────────────────
+    function FileRow(props) {
+      const { file, active, onSelect } = props
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      return h(
+        'button',
+        {
+          type: 'button',
+          className: `dshCl_row${active ? ' dshCl_rowActive' : ''}`,
+          onClick: () => onSelect(file.path),
+          title: file.oldPath ? `${file.oldPath} → ${file.path}` : file.untracked ? `${file.path} (${t('untracked')})` : file.path,
+        },
+        h('span', { className: `dshCl_status ${STATUS_CLASS[file.status] ?? 'dshCl_sM'}` }, file.status),
+        h('span', { className: 'dshCl_path' }, file.path),
+        h(
+          'span',
+          { className: 'dshCl_counts' },
+          typeof file.added === 'number' && file.added > 0 ? h('span', { className: 'dshCl_add' }, `+${file.added}`) : null,
+          typeof file.deleted === 'number' && file.deleted > 0 ? h('span', { className: 'dshCl_del' }, `-${file.deleted}`) : null,
+          file.binary ? h('span', { className: 'dshCl_counts' }, t('binary')) : null,
+        ),
+      )
+    }
+
+    function DiffPane(props) {
+      const { diff, phase, wrap, path: changedPath } = props
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      const path = changedPath
+      if (!path) return h('div', { className: 'dshCl_center' }, t('chooseFile'))
+      if (phase === 'loading') return h('div', { className: 'dshCl_center' }, t('loadingDiff'))
+      if (phase === 'error') return h('div', { className: 'dshCl_center dshCl_error' }, diff?.message ?? t('missing'))
+      if (!diff || diff.missing) return h('div', { className: 'dshCl_center' }, t('missing'))
+      if (diff.binary) return h('div', { className: 'dshCl_center' }, t('binary'))
+
+      const lines = String(diff.text ?? '').split('\n')
+      if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+      const shown = lines.slice(0, MAX_RENDER_LINES)
+
+      return h(
+        'div',
+        { className: `dshCl_diffWrap${wrap ? ' dshCl_wrap' : ''}` },
+        h(
+          'div',
+          { className: 'dshCl_diffHead' },
+          h('span', null, diff.path),
+          h('span', null, diff.base ? `→ ${diff.base}` : ''),
+          diff.untracked ? h('span', null, t('createdAt')) : null,
+        ),
+        h(
+          'div',
+          { className: 'dshCl_diffBody' },
+          h(
+            'pre',
+            { className: 'dshCl_pre' },
+            shown.map((line, index) => {
+              const kind = lineKind(line)
+              return h('span', { key: index, className: `dshCl_line ${LINE_CLASS[kind]}` }, line === '' ? ' ' : line)
+            }),
+          ),
+        ),
+        diff.truncated || lines.length > shown.length
+          ? h('div', { className: 'dshCl_note' }, t('truncated', { count: shown.length }))
+          : null,
+      )
+    }
+
+    function SummaryBody(props) {
+      const { snapshot } = props
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      const { phase, state, error, selected, diff, diffPhase, targets, target } = snapshot
+
+      // The picker stays available in every state, so a wrong or failing target
+      // can always be switched away from without hunting for the right session.
+      const options = [...targets]
+      if (target && !options.some((entry) => targetKey(entry) === targetKey(target))) {
+        options.unshift({ ...target, title: target.title || t('panel') })
+      }
+      const picker =
+        options.length > 1
+          ? h(
+              'div',
+              { className: 'dshCl_picker' },
+              h(
+                'select',
+                {
+                  className: 'dshCl_select',
+                  value: target ? targetKey(target) : '',
+                  onChange: (event) => {
+                    const next = options.find((entry) => targetKey(entry) === event.target.value)
+                    if (next) selectTarget(next, t)
+                  },
+                  'aria-label': t('panel'),
+                },
+                options.map((entry) => {
+                  const label = entry.title || entry.id
+                  return h(
+                    'option',
+                    { key: targetKey(entry), value: targetKey(entry) },
+                    entry.dir ? `${label} — ${entry.dir}` : label,
+                  )
+                }),
+              ),
+            )
+          : null
+
+      const detail = state?.ok === false && state.detail ? h('div', { className: 'dshCl_detail' }, state.detail) : null
+      const hint =
+        state?.ok === false && state.reason === 'not-a-repository'
+          ? h('div', { className: 'dshCl_detail' }, t('notRepoHint'))
+          : null
+
+      if (phase === 'loading') return h('div', { className: 'dshCl_body' }, picker, h('div', { className: 'dshCl_center' }, t('loading')))
+      if (phase === 'empty') {
+        return h('div', { className: 'dshCl_body' }, picker, h('div', { className: 'dshCl_center' }, error ?? t('noTargets')))
+      }
+      if (state?.ok === false) {
+        return h(
+          'div',
+          { className: 'dshCl_body' },
+          picker,
+          h('div', { className: 'dshCl_center dshCl_error' }, h('div', null, state.message ?? t('notRepo'), detail, hint)),
+        )
+      }
+      if (phase === 'error') {
+        return h('div', { className: 'dshCl_body' }, picker, h('div', { className: 'dshCl_center dshCl_error' }, t('error', { message: error ?? '' })))
+      }
+      if (phase === 'clean') {
+        return h('div', { className: 'dshCl_body' }, picker, h('div', { className: 'dshCl_center' }, t('cleanAgainst', { base: state?.base ?? '' })))
+      }
+
+      const files = Array.isArray(state?.files) ? state.files : []
+      return h(
+        'div',
+        { className: 'dshCl_body' },
+        picker,
+        h(
+          'div',
+          { className: 'dshCl_list' },
+          files.map((file) =>
+            h(FileRow, {
+              key: file.path,
+              file,
+              active: file.path === selected,
+              onSelect: (path) => {
+                store.set({ selected: path, diff: null, diffPhase: 'loading' })
+                void loadDiff(t)
+              },
+              t,
+            }),
+          ),
+        ),
+        h(DiffPane, { diff, phase: diffPhase, wrap: snapshot.wrap, path: selected, t }),
+      )
+    }
+
+    function Popover(props) {
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      const snapshot = useStore()
+      const { open, state, busy, notice, wrap, anchor } = snapshot
+
+      React.useEffect(() => {
+        if (!open) return undefined
+        const onKey = (event) => {
+          if (event.key === 'Escape') store.set({ open: false })
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, [open])
+
+      if (!open) return null
+
+      const files = Array.isArray(state?.files) ? state.files : []
+      const totals = totalOf(files)
+      // The directory stays on screen: "not a repository" must never be a
+      // mystery about which folder was inspected.
+      const targetDir = state?.dir ?? snapshot.target?.dir ?? ''
+      // Anchored under the chip when it could be measured; otherwise the
+      // stylesheet's default corner placement applies.
+      const placement = anchor
+        ? anchor.top !== null
+          ? { top: `${anchor.top}px`, right: `${anchor.right}px` }
+          : { bottom: `${anchor.bottom}px`, right: `${anchor.right}px` }
+        : undefined
+
+      return h(
+        'div',
+        { className: 'dshCl_pop', role: 'dialog', 'aria-label': t('panel'), style: placement },
+        h(
+          'div',
+          { className: 'dshCl_head' },
+          h('h3', { className: 'dshCl_title' }, t('panel')),
+          state?.ok
+            ? h(
+                'div',
+                { className: 'dshCl_meta' },
+                h('span', null, state.branch),
+                h('span', null, `→ ${state.base}`),
+                state.ahead > 0 ? h('span', null, `↑${state.ahead}`) : null,
+                state.behind > 0 ? h('span', null, `↓${state.behind}`) : null,
+                h('span', { className: 'dshCl_add' }, `+${totals.added}`),
+                h('span', { className: 'dshCl_del' }, `-${totals.deleted}`),
+              )
+            : null,
+          h(
+            'button',
+            { type: 'button', className: 'dshCl_btn', disabled: busy || !snapshot.target, onClick: () => void loadState({ t }) },
+            t('refresh'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dshCl_btn',
+              disabled: busy || !snapshot.target,
+              onClick: () => void loadState({ fetchRemote: true, t }),
+            },
+            t('fetchRemote'),
+          ),
+          h(
+            'button',
+            { type: 'button', className: 'dshCl_btn', onClick: () => store.set({ wrap: !wrap }) },
+            wrap ? t('noWrap') : t('wrapping'),
+          ),
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'dshCl_iconBtn',
+              onClick: () => store.set({ open: false }),
+              title: t('close'),
+              'aria-label': t('close'),
+            },
+            '✕',
+          ),
+        ),
+        h(
+          'div',
+          { className: 'dshCl_dir', title: `${t('directory')}: ${targetDir}` },
+          targetDir,
+        ),
+        h(SummaryBody, { snapshot, t }),
+        snapshot.hostCompat === 'dir' ? h('div', { className: 'dshCl_note' }, t('oldHost')) : null,
+        notice ? h('div', { className: 'dshCl_note' }, notice) : null,
+        Array.isArray(state?.notes) && state.notes.length > 0 ? h('div', { className: 'dshCl_note' }, state.notes.join('\n')) : null,
+      )
+    }
+
+    function ChangelistChip(props) {
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      const snapshot = useStore()
+      // A slot-provided session wins; otherwise ask the client service which
+      // session the main view is showing, so the chip follows the project the
+      // user is actually looking at rather than a remembered directory.
+      const sessionId =
+        props.sessionId ?? (typeof props.getViewedSessionId === 'function' ? props.getViewedSessionId() : null) ?? null
+
+      React.useEffect(() => {
+        let cancelled = false
+        const apply = async (id) => {
+          const targets = await loadTargets()
+          if (cancelled) return
+          const target = pickTarget(targets, id)
+          if (!target) return
+          await selectTarget(target, t)
+        }
+        void apply(sessionId)
+        // Follow the session once it becomes known, and across session switches.
+        const unsubscribe =
+          typeof props.subscribeViewedSession === 'function'
+            ? props.subscribeViewedSession((nextId) => {
+                const current = store.get().target
+                const currentId = current?.kind === 'session' ? current.id : null
+                if (nextId && nextId !== currentId) void apply(nextId)
+              })
+            : undefined
+        return () => {
+          cancelled = true
+          if (typeof unsubscribe === 'function') unsubscribe()
+        }
+      }, [])
+
+      const { phase, state, error, open } = snapshot
+      const files = Array.isArray(state?.files) ? state.files : []
+      const totals = totalOf(files)
+
+      let dot = 'loading'
+      let label = t('summary')
+      if (phase === 'clean') {
+        dot = 'clean'
+        label = t('clean')
+      } else if (state?.reason === 'not-a-repository') {
+        // A workspace outside version control is a fact about the folder, not a
+        // failure of the panel, so it reads neutral instead of alarming.
+        dot = 'norepo'
+        label = t('notRepoChip')
+      } else if (phase === 'error' || state?.ok === false || phase === 'empty') {
+        dot = 'error'
+        label = t('summary')
+      } else if (phase === 'ready') {
+        dot = 'dirty'
+        label = `${files.length}`
+      }
+
+      const detail = state?.ok
+        ? `${state.branch} → ${state.base}  ·  +${totals.added} −${totals.deleted}`
+        : (error ?? t('hint'))
+      const where = state?.dir ?? snapshot.target?.dir ?? ''
+
+      return h(
+        'div',
+        { className: 'dshCl_root' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dshCl_chip',
+            'data-open': open ? 'true' : 'false',
+            title: `${t('panel')}\n${where}\n${detail}`,
+            'aria-label': t('panel'),
+            onClick: (event) => {
+              const next = !store.get().open
+              store.set({ open: next, anchor: next ? measureAnchor(event) : store.get().anchor })
+              if (next) void loadState({ t })
+            },
+          },
+          h('span', { className: 'dshCl_dot', 'data-state': dot }),
+          phase === 'ready'
+            ? [
+                h('span', { key: 'n', className: 'dshCl_chipText' }, t('shortFiles', { count: files.length })),
+                h('span', { key: 'a', className: 'dshCl_chipAdd' }, `+${totals.added}`),
+                h('span', { key: 'd', className: 'dshCl_chipDel' }, `−${totals.deleted}`),
+              ]
+            : h('span', { className: 'dshCl_chipText' }, label),
+        ),
+      )
+    }
+
+    return {
+      inject: ['slots', 'locale', 'sessions'],
+      apply(ctx) {
+        if (typeof ctx.locale?.register === 'function') {
+          ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'changelist: dictionaries')
+        }
+        const t = typeof ctx.locale?.bind === 'function' ? ctx.locale.bind(NS) : fallbackTranslator
+        const getViewedSessionId = () => viewedSessionId(ctx.sessions)
+        const subscribeViewedSession = (listener) => watchViewedSession(ctx.sessions, listener)
+
+        ctx.effect(() => {
+          const tagId = '@local/dsh-changelist/changelist.css'
+          if (typeof document === 'undefined' || document.querySelector(`style[data-plugin-css="${tagId}"]`) !== null) {
+            return () => {}
+          }
+          const tag = document.createElement('style')
+          tag.dataset.plugin = '@local/dsh-changelist'
+          tag.dataset.pluginCss = tagId
+          tag.textContent = css
+          document.head.appendChild(tag)
+          return () => {
+            tag.remove()
+          }
+        }, 'changelist: styles')
+
+        // Top-right summary chip, inside the session header's utilities row.
+        ctx.slots.inject('conversation.session.header.utilities', () =>
+          ctx.slots.register(
+            {
+              name: 'conversation.session.header.utilities',
+              id: CHIP_ID,
+              order: 0,
+              locale: NS,
+              inject: () => ({ getViewedSessionId, subscribeViewedSession }),
+            },
+            ChangelistChip,
+          ),
+        )
+
+        // The floating summary itself, in the shell overlay layer.
+        ctx.slots.inject('shell.overlay', () =>
+          ctx.slots.register(
+            {
+              name: 'shell.overlay',
+              id: POPOVER_ID,
+              order: 0,
+              locale: NS,
+            },
+            Popover,
+          ),
+        )
+      },
+    }
+  },
+})

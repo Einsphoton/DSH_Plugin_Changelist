@@ -1,0 +1,5 @@
+# Plugin activity log — local diagnostics only, never published
+.diagnostics/
+# Test scratch rebuilt by test-fixture.mjs
+.changelist-test/
+node_modules/

@@ -1,0 +1,6 @@
+# Workspace-changelist bundle: one row mounting both halves of the plugin.
+# The host half registers the /api/changelist.* routes; dsh-client-modules
+# attaches client.js (this package's `dsh.client` metadata) to the same row.
+- insert:
+    - id: changelist
+      name: '@local/dsh-changelist'
