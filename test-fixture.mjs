@@ -1,34 +1,67 @@
 /**
  * Shared test fixture: a real git repository with a real remote-tracking
- * branch, plus a git runner that works inside a sandbox forbidding piped child
+ * branch, plus a command runner that works in a sandbox forbidding piped child
  * stdio (this plugin's own production runner uses ordinary pipes).
  *
- * The fixture lives under `.changelist-test/` beside the package so the suites
- * are self-contained: run `node test-fixture.mjs` (or any suite) from the
- * workspace root and the repository is rebuilt from scratch.
+ * Paths are package-relative, so the suites run from the package directory or
+ * from the workspace root. `.changelist-test/` sits inside the package, which is
+ * itself a git checkout, so git's upward search is capped at the package by
+ * `GIT_CEILING_DIRECTORIES`; `FIXTURE_OUTSIDE` exists for the probes that must
+ * find no work tree at all.
  */
 import { spawnSync } from 'node:child_process'
 import fs from 'node:fs'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const PACKAGE_DIR = path.dirname(fileURLToPath(import.meta.url))
 
 /** Fixture root; kept one level down so extracting the Cordis framework beside it survives a rebuild. */
-export const FIXTURE_ROOT = path.resolve('.changelist-test/fixture')
+export const FIXTURE_ROOT = path.join(PACKAGE_DIR, '.changelist-test', 'fixture')
 export const FIXTURE_REPO = path.join(FIXTURE_ROOT, 'repo')
 export const FIXTURE_REMOTE = path.join(FIXTURE_ROOT, 'remote.git')
+/**
+ * A real directory that belongs to no git repository, for the "this is not a
+ * work tree" probes. It is deliberately separate from FIXTURE_ROOT: the fixture
+ * lives inside this package, which is itself a git checkout, so the fixture root
+ * is *inside* a work tree and git reports success for it.
+ */
+export const FIXTURE_OUTSIDE = path.join(PACKAGE_DIR, '.changelist-test', 'outside')
 
 const captureOut = path.join(FIXTURE_ROOT, 'stdout.bin')
 const captureErr = path.join(FIXTURE_ROOT, 'stderr.bin')
+
+/**
+ * Build the spawn call for one command.
+ *
+ * Node refuses to spawn a batch file without a shell (EINVAL since the
+ * CVE-2024-27980 hardening), and the Perforce fixture's fake `p4` is a `.cmd`
+ * shim. A batch command is therefore handed to the shell as one pre-quoted
+ * string — the documented safe form — which keeps every suite working on any
+ * Windows machine instead of depending on a Node version that still allowed it.
+ */
+function spawnCommand(file, args, options) {
+  const isBatch = process.platform === 'win32' && /\.(cmd|bat)$/i.test(file)
+  const quote = (part) => (/[\s"]/.test(part) ? `"${part.replace(/"/g, '""')}"` : part)
+  if (isBatch) {
+    return spawnSync([quote(file), ...args.map(quote)].join(' '), { ...options, shell: true })
+  }
+  return spawnSync(file, args, options)
+}
 
 /** Run one command with stdout/stderr redirected to files, returning trimmed buffers. */
 export function spawnCaptured(file, args, options = {}) {
   fs.mkdirSync(FIXTURE_ROOT, { recursive: true })
   const fo = fs.openSync(captureOut, 'w')
   const fe = fs.openSync(captureErr, 'w')
-  const result = spawnSync(file, args, {
+  const result = spawnCommand(file, args, {
     cwd: options.cwd,
     stdio: ['ignore', fo, fe],
     windowsHide: true,
-    env: options.env,
+    // The fixture lives inside this package, which is a real git checkout, so
+    // without a ceiling git's upward search would treat any path under the
+    // package as a work tree and the "not a repository" probes would lie.
+    env: { ...(options.env ?? process.env), GIT_CEILING_DIRECTORIES: PACKAGE_DIR },
   })
   fs.closeSync(fo)
   fs.closeSync(fe)
@@ -67,6 +100,7 @@ export function fileRedirectExecFile(file, args, options, callback) {
 export function buildFixture() {
   fs.rmSync(FIXTURE_ROOT, { recursive: true, force: true })
   fs.mkdirSync(FIXTURE_REPO, { recursive: true })
+  fs.mkdirSync(FIXTURE_OUTSIDE, { recursive: true })
 
   const git = (args, cwd = FIXTURE_REPO) => {
     const result = spawnCaptured('git', args, { cwd })

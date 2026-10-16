@@ -22,7 +22,7 @@ import {
   parseNumstat,
   scanContent,
 } from './lib/git.js'
-import { FIXTURE_ROOT, buildFixture, createFixtureRunner } from './test-fixture.mjs'
+import { FIXTURE_OUTSIDE, FIXTURE_ROOT, buildFixture, createFixtureRunner } from './test-fixture.mjs'
 
 const run = createFixtureRunner()
 const fixture = buildFixture()
@@ -139,9 +139,20 @@ const diffDeleted = await readDiff({ run, readFile, dir: repo, base: base.base, 
 checkThat('deleted diff shows removal', diffDeleted.text.includes('-keep'))
 
 console.log('5. non-repository directory')
-const notRepo = FIXTURE_ROOT
+// FIXTURE_OUTSIDE is a plain directory; the fixture root is also treated as one
+// because the fixture runner sets GIT_CEILING_DIRECTORIES to this package. That
+// ceiling matters: the package is itself a git checkout, so without it git's
+// upward search would answer "yes, a work tree" for every path under the
+// package and this probe would pass or fail depending on the current directory.
+const notRepo = FIXTURE_OUTSIDE
 const outside = await inspectWorkspace({ run, readFile, dir: notRepo, base: 'HEAD' })
 check('outside a work tree', { ok: outside.ok, reason: outside.reason }, { ok: false, reason: 'not-a-repository' })
+const fixtureRoot = await inspectWorkspace({ run, readFile, dir: FIXTURE_ROOT, base: 'HEAD' })
+checkThat(
+  'the fixture is shielded from the package checkout it lives in',
+  fixtureRoot.ok === false && fixtureRoot.reason === 'not-a-repository',
+  `FIXTURE_ROOT ok=${fixtureRoot.ok} reason=${fixtureRoot.reason}`,
+)
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

@@ -6,12 +6,17 @@
   "type": "module",
   "exports": {
     ".": "./index.js",
-    "./client": "./client.js"
+    "./client": "./client.js",
+    "./lib/git": "./lib/git.js",
+    "./lib/p4": "./lib/p4.js",
+    "./lib/vcs": "./lib/vcs.js"
   },
   "files": [
     "index.js",
     "client.js",
     "lib/git.js",
+    "lib/p4.js",
+    "lib/vcs.js",
     "cordis.patch.yml",
     "README.md"
   ],
@@ -30,7 +35,9 @@
   },
   "scripts": {
     "test": "node selftest.mjs && node host-test.mjs && node client-test.mjs",
-    "test:integration": "node integration-test.mjs"
+    "test:p4": "node p4-test.mjs && node verify-p4.mjs",
+    "test:integration": "node integration-test.mjs",
+    "test:p4-e2e": "node p4-e2e.mjs"
   },
   "license": "MIT"
 }

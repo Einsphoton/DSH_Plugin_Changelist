@@ -14,9 +14,24 @@ import path from 'node:path'
 
 import { apply, collectTargets, createRoutes, gitEnvironment, safeRepoPath, ROUTES } from './index.js'
 import { createFileReader, inspectWorkspace } from './lib/git.js'
+import {
+  FAKE_P4_CLIENT,
+  FAKE_P4_DEPOT,
+  FAKE_P4_ROOT,
+  FAKE_P4_SHIM,
+  FAKE_P4_USER,
+  buildP4Fixture,
+  createFakeP4ExecFile,
+  readP4Calls,
+  resetP4Calls,
+} from './p4-fixture.mjs'
 import { FIXTURE_ROOT, buildFixture, createFixtureRunner, fileRedirectExecFile } from './test-fixture.mjs'
 
 const repo = buildFixture().repo
+// The Perforce fixture is built next to the git one; `p4Repo` is its synthetic
+// client root, so the p4 cases exercise the real process chain the plugin uses.
+const p4Repo = buildP4Fixture().root
+resetP4Calls()
 
 let failures = 0
 let checks = 0
@@ -303,6 +318,156 @@ checkThat(
   typeof outside.detail === 'string' && outside.detail.includes('not a git repository'),
   String(outside.detail),
 )
+
+console.log('7. the vcs parameter (Perforce alongside git)')
+// The fake p4 is a real process, so this section proves the whole chain:
+// vcs selection -> p4 runner -> -ztag parsing -> mapped state answer.
+// Node 24 refuses to spawn a `.cmd` without a shell (EINVAL), so the p4 cases
+// use the fixture's own spawn seam — the same contract, different launcher.
+const p4ExecFile = createFakeP4ExecFile()
+const p4Routes = createRoutes(
+  ctx,
+  {
+    allowedPaths: [p4Repo],
+    gitPath: 'definitely-not-git',
+    vcs: 'auto',
+    diagnostics: false,
+    p4Path: FAKE_P4_SHIM,
+  },
+  {
+    execFile: (file, args, options, callback) =>
+      file === FAKE_P4_SHIM ? p4ExecFile(file, args, options, callback) : fileRedirectExecFile(file, args, options, callback),
+  },
+)
+const p4StateResponse = await p4Routes.handleState(
+  new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(p4Repo)}&vcs=p4`),
+)
+const p4State = await p4StateResponse.json()
+check('the p4 state route answers ok', p4State.ok, true)
+check('the answer names the p4 backend', p4State.vcs, 'p4')
+check('the workspace names the client and its root', [p4State.workspace?.client, p4State.workspace?.root], [
+  FAKE_P4_CLIENT,
+  FAKE_P4_ROOT,
+])
+check('options carry what the connection panel reads', {
+  localEdits: p4State.options?.localEdits,
+  shelved: p4State.options?.shelved,
+  scanTimeoutMs: typeof p4State.options?.scanTimeoutMs === 'number',
+  p4Path: p4State.options?.p4Path,
+}, { localEdits: false, shelved: true, scanTimeoutMs: true, p4Path: FAKE_P4_SHIM })
+checkThat('revisions report have and head', typeof p4State.revisions?.have === 'number' && typeof p4State.revisions?.head === 'number', JSON.stringify(p4State.revisions))
+checkThat('changelists are grouped and user-scoped', Array.isArray(p4State.changelists) && p4State.changelists.length > 0, JSON.stringify(p4State.changelists))
+checkThat(
+  'every numbered changelist belongs to the workspace user',
+  p4State.changelists.every((entry) => entry.isDefault || entry.user === FAKE_P4_USER),
+  JSON.stringify(p4State.changelists.map((entry) => [entry.number, entry.user])),
+)
+checkThat(
+  'files stay client-relative and carry the p4 fields',
+  p4State.files.length > 0 &&
+    p4State.files.every(
+      (file) =>
+        !file.path.startsWith('/') &&
+        !file.path.includes('..') &&
+        typeof file.depotPath === 'string' &&
+        file.depotPath.startsWith('//') &&
+        ['opened', 'local', 'shelved'].includes(file.origin),
+    ),
+  JSON.stringify(p4State.files.slice(0, 2)),
+)
+check('total equals the file count when nothing is capped', p4State.total, p4State.files.length)
+
+const autoState = await (
+  await p4Routes.handleState(new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(p4Repo)}&vcs=auto`))
+).json()
+check('auto detection reaches p4 when git is unavailable', autoState.vcs, 'p4')
+
+const forcedGit = await (
+  await p4Routes.handleState(new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(p4Repo)}&vcs=git`))
+).json()
+check('forcing git on a p4-only directory refuses instead of lying', { ok: forcedGit.ok, vcs: forcedGit.vcs, reason: forcedGit.reason }, {
+  ok: false,
+  vcs: null,
+  reason: 'not-a-repository',
+})
+
+const p4Diff = await (
+  await p4Routes.handleDiff(
+    new Request(
+      `http://localhost/api/changelist.diff?dir=${encodeURIComponent(p4Repo)}&vcs=p4&path=${encodeURIComponent('Content/Example/style/Asset_Example_Style.json')}&depotPath=${encodeURIComponent(`//${FAKE_P4_DEPOT.replace(/^\/\//, '')}/Content/Example/style/Asset_Example_Style.json`)}&changed=1`,
+    ),
+  )
+).json()
+check('the p4 diff route answers with unified text', [p4Diff.ok, p4Diff.vcs, p4Diff.binary], [true, 'p4', false])
+checkThat('the comparison carries the added line', String(p4Diff.text).includes('"b": 3'), String(p4Diff.text).slice(0, 200))
+
+const fakeCalls = readP4Calls()
+checkThat(
+  'the whole-workspace enumeration never happened',
+  !fakeCalls.some((line) => /(^|\s)fstat(\s|$)/.test(line) && /\/\.\.\./.test(line) && !/^-d\s/.test(line) && /\/\/fake_client\/\.\.\./.test(line)),
+  JSON.stringify(fakeCalls.filter((line) => line.includes('fstat')).slice(0, 3)),
+)
+checkThat(
+  'no writing command was issued',
+  !fakeCalls.some((line) => /(^|\s)(submit|sync|edit|add|delete|shelve|changelist|revert|reconcile|clean)(\s|$)/.test(line)),
+  JSON.stringify(fakeCalls),
+)
+
+console.log('7b. the connection P4V already knows')
+// The Host runs p4 with a scrubbed environment, so an installation whose
+// P4PORT/P4USER live only in P4V (or in the registry, where `p4 set` puts them)
+// would otherwise look like "no Perforce here" and the directory would be
+// reported as a plain git-less folder. This section proves the Host wires the
+// discovered values into the connection: the config seam stands in for the
+// machine's own ~/.p4qt, so the suite never depends on the machine running it.
+const discoveredP4V = {
+  port: 'p4v.example.com:1666',
+  user: 'p4v-user',
+  client: FAKE_P4_CLIENT,
+  charset: 'utf8',
+  clientRoot: null,
+  sources: ['connectionmap.xml'],
+}
+const discoveredRoutes = createRoutes(
+  ctx,
+  {
+    allowedPaths: [p4Repo],
+    gitPath: 'definitely-not-git',
+    vcs: 'auto',
+    diagnostics: false,
+    p4Path: FAKE_P4_SHIM,
+  },
+  {
+    execFile: (file, args, options, callback) =>
+      file === FAKE_P4_SHIM ? p4ExecFile(file, args, options, callback) : fileRedirectExecFile(file, args, options, callback),
+    readP4VConfig: () => discoveredP4V,
+  },
+)
+const discoveredState = await (
+  await discoveredRoutes.handleState(new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(p4Repo)}&vcs=auto`))
+).json()
+check('no connection in config still reaches p4', discoveredState.vcs, 'p4')
+const echoed = discoveredState.options?.discovered ?? {}
+check(
+  'the discovered connection is echoed to the panel',
+  { port: echoed.port, user: echoed.user, client: echoed.client, charset: echoed.charset, from: echoed.from },
+  { port: 'p4v.example.com:1666', user: 'p4v-user', client: FAKE_P4_CLIENT, charset: 'utf8', from: 'p4v' },
+)
+checkThat(
+  'the answer says where the connection came from',
+  (discoveredState.notes ?? []).some((note) => String(note).includes('P4V')),
+  JSON.stringify(discoveredState.notes),
+)
+check('the discovered user is what scopes the answer', discoveredState.workspace?.user, 'p4v-user')
+
+// An explicit request parameter still wins over anything discovered.
+const overridden = await (
+  await discoveredRoutes.handleState(
+    new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(p4Repo)}&vcs=auto&p4user=${encodeURIComponent('typed-by-hand')}`),
+  )
+).json()
+check('a typed-in user overrides the discovered one', overridden.workspace?.user, 'typed-by-hand')
+check('a typed-in user also overrides it in the echoed panel values', overridden.options?.discovered?.user, 'typed-by-hand')
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)
