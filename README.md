@@ -268,7 +268,7 @@ node dsh-changelist/extract-from-asar.mjs "C:\Users\you\AppData\Local\Programs\D
 node dsh-changelist/integration-test.mjs ".changelist-test/cordis/node_modules/@deepseek-ai/cordis"
 ```
 
-`npm test` 跑 git 数据层、Host 半边与浏览器半边三个套件（本次发布时 27 + 83 + 185 = 295 项断言全绿）；Perforce 的两个套件单独走 `npm run test:p4` —— **本次发布时它们在本机未能跑通**，详见下面的「发布时的已知问题」。`integration-test.mjs` 需要真实 Cordis，单独运行；`p4-e2e.mjs` 需要真实服务器，没有就跳过。
+`npm test` 跑 git 数据层、Host 半边与浏览器半边三个套件（本次改动后 27 + 91 + 202 = 320 项断言全绿）；Perforce 的两个套件单独走 `npm run test:p4` —— **本机仍未跑通**，详见下面的「发布时的已知问题」。`integration-test.mjs` 需要真实 Cordis，单独运行；`p4-e2e.mjs` 需要真实服务器，没有就跳过。
 
 ### 发布时的已知问题（Perforce 套件）
 
@@ -295,23 +295,20 @@ node dsh-changelist/integration-test.mjs ".changelist-test/cordis/node_modules/@
 | 数据层（27 项） | 真实仓库 + 真实 `origin/main`：上游解析、ahead/behind、`--name-status -z` / `--numstat -z` 解析、重命名、未跟踪、二进制、删除、对比合成、非仓库目录、路径遍历防护；夹具自身被 `GIT_CEILING_DIRECTORIES` 与所在包的 git 检出隔离（否则「不是 git 工作区」这条断言会随启动目录变化） |
 | Perforce 数据层（86 项） | `p4-fixture.mjs` 的假 p4：`-ztag` 解析、`opened`/`status`/`fstat`/`changes` 映射、changelist 与 shelved、depot↔本地路径映射、超时与降级；以及 `readP4VConfig` 对 `connectionmap.xml` / `ApplicationSettings.xml` 的读取（主机名优先于 IP、逗号工作区名、Buffer 输入、无 P4V 时静默、无可读 home 时返回 null 而不是抛错） |
 | 对抗性验证（`verify-p4.mjs`，143 项） | 独立于作者的边界探测：检测顺序与 60 秒缓存、只读命令审计（含 `p4 help status` 佐证）、`maxFiles`/`maxDiffBytes` 边界、客户端视图外的 shelved、环境剥离、以及本文档若干断言的逐条复核；7 个已修问题各有 `OK RESOLVED` 挂钩的断言；对真实服务器的"opened 集合按 action 分组后原样往返"（不写死文件数——工作区内容会变） |
-| Host 半边（83 项） | 真实路由处理器 → 真实 git → JSON：三条路由注册在 `/api/` 围栏内、GET + buffered、effect 拥有 4 个 disposer（1 个卸载钩子 + 3 条路由）且 yield 的全是函数、`dir` 的 403/400 鉴权、**`sessionId` 由 Host 解析工作目录且未知会话返回 404**、目录去重与容错（服务抛错 / 返回非数组 / 工作区根取值异常都不影响路由）、缺 git 时结构化失败、`fetch=1` 无论成败都带 git 的消息且不影响清单、`maxFiles`/`maxDiffBytes` 截断与提示、`vcs=auto|git|p4` 分派与 `depotPath` 校验；**活动日志**（挂载/卸载/每次路由命中与结果，诊断路径不可写时也不影响响应）；**无连接配置时也按发现到的 P4V 连接判定为 Perforce、把 `options.discovered` 回显给面板、并让显式请求参数优先**（用 `deps.readP4VConfig` 注入，不依赖跑测试的那台机器） |
-| 浏览器半边（185 项 = 既有 71 + Perforce 93 + 21 项补强） | ModuleLoader 契约；两个表面注册到 `conversation.session.header.utilities` 与 `shell.overlay`；胶囊显示文件数与 `+/−`、状态点、hover 摘要；**点击胶囊打开浮窗**（表头/清单/对比着色/切换器/提示/请求 URL）；**Esc 关闭**；浮窗**锚定在胶囊下方**、视口不够高时自动翻到上方、量不到位置时回落到样式表默认；**当前会话永远优先于记忆目录**（并把污染过的那份记忆改用 `.v2` 键丢弃）、**会话出现较晚或在同一窗口切换会话时会自动改瞄**（修掉了实测到的挂载竞态）、会话不在列表里也能按 `sessionId` 定位、失败状态下目录选择器依然可用、**浮窗常驻显示被检查的目录**并显示 git 的原话与「可 git init」提示、非 git 工作区在胶囊上呈中性色（不是报错色）；旧版 Host 只认 `dir` 时自动重试并提示「Host 半边版本较旧」；locale 不可用时仍注册并渲染（回退显示消息键）。Perforce 侧在同一套件里覆盖：`vcs=auto|p4` 请求参数与 v3 记忆键（含无法识别的取值退回 `auto`）、胶囊 `P4` 标记、changelist 分组与折叠（状态在 store、按目标记忆）、本地未 opened 分组、shelved / `needsSync` 徽标、连接面板覆盖项与 `localEdits=1|0`（并断言「应用」不写任何本地存储）、`p4-unavailable`/`not-a-workspace` 的降级渲染、无 `changelists` 时回退扁平清单；**后端选择按目标记忆**（15b：一个窗口在 P4 工程与 git 工程之间切换时，两边互不继承，含旧版单一全局键的兼容回退）、**连接信息按目标记忆**（14c：在 A 工程填的 port/user 绝不随 B 工程的请求发出，回到 A 仍然生效）、**P4 连不上且什么都没读到时会自动展开「连接」面板并说明原因**，而 git/正常回答不会弹面板 |
+| Host 半边（91 项） | 真实路由处理器 → 真实 git → JSON：三条路由注册在 `/api/` 围栏内、GET + buffered、effect 拥有 4 个 disposer（1 个卸载钩子 + 3 条路由）且 yield 的全是函数、`dir` 的 403/400 鉴权、**`sessionId` 由 Host 解析工作目录且未知会话返回 404**、目录去重与容错（服务抛错 / 返回非数组 / 工作区根取值异常都不影响路由）、缺 git 时结构化失败、`fetch=1` 无论成败都带 git 的消息且不影响清单、`maxFiles`/`maxDiffBytes` 截断与提示、`vcs=auto|git|p4` 分派与 `depotPath` 校验；**强制某一种后端时不再探测另一种工具**（`vcs=git` 在 git 仓库上零 p4 进程，`vcs=auto` 仍会并行探测两者）；**并发相同请求只执行一次读取**（两个并发 state 请求共享同一次 git 读取，各拿到一份可独立消费的响应）；**活动日志**（挂载/卸载/每次路由命中与结果，诊断路径不可写时也不影响响应，写日志不阻塞响应）；**无连接配置时也按发现到的 P4V 连接判定为 Perforce、把 `options.discovered` 回显给面板、并让显式请求参数优先**（用 `deps.readP4VConfig` 注入，不依赖跑测试的那台机器） |
+| 浏览器半边（202 项 = 既有 71 + Perforce 93 + 21 项补强 + 17 项本轮） | ModuleLoader 契约；两个表面注册到 `conversation.session.header.utilities` 与 `shell.overlay`；胶囊显示文件数与 `+/−`、状态点、hover 摘要；**点击胶囊打开浮窗**（表头/清单/对比着色/切换器/提示/请求 URL）；**Esc 关闭**、**点击浮窗与胶囊之外的任何地方关闭**；浮窗**锚定在胶囊下方**、视口不够高时自动翻到上方、量不到位置时回落到样式表默认；**当前会话永远优先于记忆目录**（并把污染过的那份记忆改用 `.v2` 键丢弃）、**会话出现较晚或在同一窗口切换会话时会自动改瞄**（修掉了实测到的挂载竞态）、会话不在列表里也能按 `sessionId` 定位、失败状态下目录选择器依然可用、**浮窗常驻显示被检查的目录**并显示 git 的原话与「可 git init」提示、非 git 工作区在胶囊上呈中性色（不是报错色）；旧版 Host 只认 `dir` 时自动重试并提示「Host 半边版本较旧」；locale 不可用时仍注册并渲染（回退显示消息键）。**本轮补强**：刷新后若选中的文件已不在清单里，选中项改到新清单的第一个并**重新读取它的对比**（不再出现「表头是新路径、内容是旧文件」）、连续快速点两个文件时**慢的旧回答不会覆盖新文件**、文件行目录与文件名分两段渲染（窄宽度先省目录、文件名始终可见）、双击行复制路径并给出「已复制/复制失败」反馈、表头显示本次读取时间、加载中显示骨架行而不是空白。Perforce 侧在同一套件里覆盖：`vcs=auto|p4` 请求参数与 v3 记忆键（含无法识别的取值退回 `auto`）、胶囊 `P4` 标记、changelist 分组与折叠（状态在 store、按目标记忆）、本地未 opened 分组、shelved / `needsSync` 徽标、连接面板覆盖项与 `localEdits=1|0`（并断言「应用」不写任何本地存储）、`p4-unavailable`/`not-a-workspace` 的降级渲染、无 `changelists` 时回退扁平清单；**后端选择按目标记忆**（15b：一个窗口在 P4 工程与 git 工程之间切换时，两边互不继承，含旧版单一全局键的兼容回退）、**连接信息按目标记忆**（14c：在 A 工程填的 port/user 绝不随 B 工程的请求发出，回到 A 仍然生效）、**P4 连不上且什么都没读到时会自动展开「连接」面板并说明原因**，而 git/正常回答不会弹面板 |
 | 真实 Cordis（15 项） | 注入服务就绪前插件保持 pending、就绪后注册 3 条 `/api` 路由、真实 `Request` → `Response`、`ctx.get` 对缺失服务返回 undefined、**卸载后 3 条路由全部释放** |
 | 真实服务器端到端（8 项） | 本机 `p4.example.com:1666`（= `192.0.2.10:1666`）：真实 `opened` → 真实对比、状态不触发整工作区枚举、**P4V 界面里的主机名与 IP 解析到同一个 client/root**、`vcs=git` 在纯 Perforce 目录上如实降级 |
 
-本次改动后的实测结果（2026-10-16，全部串行执行）：
+本次改动后的实测结果（在本机 Windows 沙箱里串行执行）：
 
 ```
 node selftest.mjs      27/27
-node p4-test.mjs       86/86
-node host-test.mjs     83/83
-node client-test.mjs  176/176
-node verify-p4.mjs    143/143
-node p4-e2e.mjs         8/8
+node host-test.mjs     91/91
+node client-test.mjs  202/202
 ```
 
-前五个由 `npm test` 串行执行（共 524 项）；`p4-e2e.mjs` 需要真实服务器，用 `npm run test:p4-e2e` 单跑。全部夹具都锚定到包目录（`import.meta.url`）而不是当前工作目录，所以从包目录或工作区根目录运行结果一致。
+前三者由 `npm test` 串行执行（共 320 项，全绿）。`p4-test.mjs` / `verify-p4.mjs` / `p4-e2e.mjs` 需单独运行：本机 p4 套件仍卡在探针断言（见上面的「发布时的已知问题」），`p4-e2e.mjs` 需要真实服务器。全部夹具都锚定到包目录（`import.meta.url`）而不是当前工作目录，所以从包目录或工作区根目录运行结果一致。
 
 对抗性验证发现并修掉的 7 个问题（每条都留有断言，不会回归）：`p4Environment` 原本跳过 `null` 覆盖项、导致 ambient `P4CONFIG` 泄漏进 p4 子进程；`p4TimeoutMs` 实际是死配置（`p4Limits()` 没转发 `timeoutMs`，检测探测的 `probeTimeoutMs` 也漏了）；另一个客户端的 pending 变更会变成只剩文件数的幽灵分组；`depotPath` 查询参数未校验即可直达 `p4 print`/`p4 diff`；`vcs=P4` 因比较大小写不一致而污染 60 秒缓存；`text+x` 被误判为二进制（修饰符也改为按列表比较，`+Sx` 不再被误读）；README 对 p4 环境的描述不完整。
 

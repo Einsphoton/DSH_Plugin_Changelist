@@ -71,6 +71,10 @@ window.__ModuleLoader__.load({
       error: '读取失败：{message}',
       hint: '点击查看工作区改动',
       directory: '目录',
+      updatedAt: '{time} 更新',
+      copyHint: '双击复制路径',
+      copiedPath: '已复制路径',
+      copyFailed: '复制失败，请在文件列表上手动选择路径',
       notRepoHint: '这里是当前会话的工作目录；若它还没有版本库，可在终端里执行 git init。',
       oldHost: 'Host 半边版本较旧：已改用目录方式读取。重启 DSH 可加载新版 Host 半边。',
       // ── Perforce ────────────────────────────────────────────────────────
@@ -161,6 +165,10 @@ window.__ModuleLoader__.load({
       error: 'Read failed: {message}',
       hint: 'Open the workspace changelist',
       directory: 'Directory',
+      updatedAt: 'updated {time}',
+      copyHint: 'Double-click to copy the path',
+      copiedPath: 'Path copied',
+      copyFailed: 'Copy failed; select the path in the list instead',
       notRepoHint: 'This is the current session’s working directory; run git init there if it has no repository yet.',
       oldHost: 'Older Host half: reading by directory instead. Restart DSH to load the current Host half.',
       // ── Perforce ────────────────────────────────────────────────────────
@@ -247,15 +255,24 @@ window.__ModuleLoader__.load({
       '.dshCl_select{flex:1;min-width:0;height:26px;padding:0 6px;border:.5px solid var(--dsw-alias-border-l3);border-radius:7px;background:var(--dsw-alias-bg-l1);color:inherit;font:inherit;font-size:12px}',
       '.dshCl_list{flex:none;min-height:0;overflow:auto;max-height:34%;padding:6px;border-bottom:.5px solid var(--dsw-alias-border-l3)}',
       '.dshCl_listFull{max-height:100%;border-bottom:none}',
-      '.dshCl_row{display:flex;align-items:center;gap:8px;width:100%;padding:4px 8px;border:none;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
+      '.dshCl_row{display:flex;align-items:center;gap:8px;width:100%;padding:4px 8px;border:none;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer;transition:background 60ms linear}',
       '.dshCl_row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
-      '.dshCl_rowActive{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshCl_rowActive{background:var(--dsw-alias-interactive-bg-hover);box-shadow:inset 2px 0 0 var(--dsw-alias-state-business-primary,#4c6ef5)}',
       '.dshCl_status{flex:none;width:13px;text-align:center;font-family:var(--ds-font-family-code);font-size:11px;font-weight:700}',
       '.dshCl_sM{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
       '.dshCl_sA{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
       '.dshCl_sD{color:var(--dsw-alias-state-error-primary,#e03131)}',
       '.dshCl_sR{color:var(--dsw-alias-state-business-primary,#4c6ef5)}',
-      '.dshCl_path{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--ds-font-family-code);font-size:12px}',
+      /* The file name must survive a narrow row: the directory gives up width
+         first, so a deep path still shows which file changed. */
+      '.dshCl_path{flex:1;min-width:0;display:flex;align-items:baseline;overflow:hidden;font-family:var(--ds-font-family-code);font-size:12px}',
+      '.dshCl_pathDir{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary)}',
+      '.dshCl_pathName{flex:none;white-space:nowrap}',
+      '.dshCl_stamp{flex:none;color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:11px;white-space:nowrap}',
+      '.dshCl_skelRow{display:flex;align-items:center;gap:8px;padding:5px 10px}',
+      '.dshCl_skelBar{height:9px;border-radius:5px;background:var(--dsw-alias-interactive-bg-hover,rgba(255,255,255,.06));animation:dshClPulse 1.4s ease-in-out infinite}',
+      '@keyframes dshClPulse{0%,100%{opacity:.5}50%{opacity:1}}',
+      '@media (prefers-reduced-motion:reduce){.dshCl_skelBar{animation:none;opacity:.7}.dshCl_row{transition:none}}',
       '.dshCl_counts{flex:none;display:flex;gap:5px;font-family:var(--ds-font-family-code);font-size:11px}',
       '.dshCl_add{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
       '.dshCl_del{color:var(--dsw-alias-state-error-primary,#e03131)}',
@@ -357,6 +374,82 @@ window.__ModuleLoader__.load({
         if (file.binary) binary += 1
       }
       return { added, deleted, binary }
+    }
+
+    /**
+     * Split a repo-relative path for display. The row keeps one flex line: the
+     * directory shrinks (and ellipsizes) first, so the file name stays readable
+     * however deep the path is. The concatenation is still the full path, which
+     * keeps the copy/tooltip/tests using the same string.
+     */
+    function pathParts(value) {
+      const full = String(value ?? '')
+      const cut = Math.max(full.lastIndexOf('/'), full.lastIndexOf('\\'))
+      return cut < 0 ? { dir: '', name: full } : { dir: full.slice(0, cut + 1), name: full.slice(cut + 1) }
+    }
+
+    /** Local wall-clock time for a Host ISO timestamp, or null when unusable. */
+    function clockOf(iso) {
+      const date = iso ? new Date(iso) : null
+      if (!date || Number.isNaN(date.getTime())) return null
+      const pad = (value) => String(value).padStart(2, '0')
+      return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+    }
+
+    /** Clipboard write with a textarea fallback; returns whether it landed. */
+    function copyText(value) {
+      const text = String(value ?? '')
+      try {
+        if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+          void navigator.clipboard.writeText(text)
+          return true
+        }
+      } catch {
+        /* fall through to the selection-based copy */
+      }
+      try {
+        if (typeof document === 'undefined' || typeof document.createElement !== 'function') return false
+        const area = document.createElement('textarea')
+        area.value = text
+        area.setAttribute?.('readonly', '')
+        document.body?.appendChild?.(area)
+        area.select?.()
+        const ok = document.execCommand?.('copy') === true
+        area.remove?.()
+        return ok
+      } catch {
+        return false
+      }
+    }
+
+    /** A short-lived inline message; a second copy replaces the first. */
+    let noticeTimer = null
+    function flashNotice(message) {
+      if (!message) return
+      store.set({ notice: message })
+      if (typeof setTimeout !== 'function') return
+      if (noticeTimer) clearTimeout(noticeTimer)
+      noticeTimer = setTimeout(() => {
+        noticeTimer = null
+        if (store.get().notice === message) store.set({ notice: null })
+      }, 2500)
+    }
+
+    /** Placeholder rows shaped like real file rows, so loading does not jump. */
+    function skeletonRows(count) {
+      const rows = []
+      for (let index = 0; index < count; index += 1) {
+        rows.push(
+          h(
+            'div',
+            { className: 'dshCl_skelRow', key: `skel-${index}` },
+            h('span', { className: 'dshCl_skelBar', style: { width: '13px' } }),
+            h('span', { className: 'dshCl_skelBar', style: { width: `${38 + index * 7}%` } }),
+            h('span', { className: 'dshCl_skelBar', style: { width: '34px', marginLeft: 'auto' } }),
+          ),
+        )
+      }
+      return rows
     }
 
     /**
@@ -649,7 +742,11 @@ window.__ModuleLoader__.load({
     }
 
     // ── loading ───────────────────────────────────────────────────────────
+    // `generation` guards whole-target reads (state and backend switches);
+    // `diffGeneration` guards one file's comparison, so a fast series of clicks
+    // can never let an older answer win.
     let generation = 0
+    let diffGeneration = 0
 
     /**
      * Should the connection panel open by itself?
@@ -677,109 +774,187 @@ window.__ModuleLoader__.load({
       return { panelOpen: true, panelAuto: true }
     }
 
-    async function loadTargets() {
-      try {
-        const body = await requestJson(`${BASE}.targets`)
-        const targets = Array.isArray(body.targets) ? body.targets : []
-        store.set({ targets })
-        if (targets.length === 0 && store.get().target === null) {
-          store.set({ phase: 'empty', error: null })
+    // Several chips (one per mounted session header) can ask for the same list at
+    // once, and a remount asks again milliseconds later. One shared in-flight
+    // promise plus a short freshness window keeps that to one request.
+    let targetsInFlight = null
+    let targetsLoadedAt = 0
+    async function loadTargets(options = {}) {
+      if (!options.force) {
+        if (targetsInFlight) return targetsInFlight
+        if (targetsLoadedAt > 0 && Date.now() - targetsLoadedAt < 1500 && store.get().targets.length > 0) {
+          return store.get().targets
         }
-        return targets
-      } catch (cause) {
-        store.set({ phase: 'error', error: cause.message })
-        return []
       }
+      const run = (async () => {
+        try {
+          const body = await requestJson(`${BASE}.targets`)
+          const targets = Array.isArray(body.targets) ? body.targets : []
+          targetsLoadedAt = Date.now()
+          store.set({ targets })
+          if (targets.length === 0 && store.get().target === null) {
+            store.set({ phase: 'empty', error: null })
+          }
+          return targets
+        } catch (cause) {
+          store.set({ phase: 'error', error: cause.message })
+          return []
+        } finally {
+          targetsInFlight = null
+        }
+      })()
+      targetsInFlight = run
+      return run
     }
+
+    // A state read for one target can be triggered by several mounted chips and
+    // by a refresh in the same tick; share the in-flight promise so the Host is
+    // not asked for the same list four times (it used to spawn ~40 processes).
+    let stateInFlight = null
 
     async function loadState(options = {}) {
       const snapshot = store.get()
       const query = targetQuery(snapshot)
       if (!query) return
-      const token = ++generation
-      store.set({ busy: true })
-      try {
-        const extra = {
-          ...(options.fetchRemote ? { fetch: '1', remote: options.remote ?? 'origin' } : {}),
-          ...requestExtra(store.get(), { localEdits: true }),
-        }
-        const { body, viaDirectory } = await requestTarget('state', query, snapshot.target, extra)
-        if (token !== generation) return
-        const files = Array.isArray(body.files) ? body.files : []
-        const selected =
-          snapshot.selected && files.some((file) => file.path === snapshot.selected)
-            ? snapshot.selected
-            : files.length > 0
-              ? files[0].path
-              : null
-        store.set({
-          state: body,
-          error: body.ok === false ? body.message ?? null : null,
-          phase: body.ok === false ? 'error' : files.length === 0 ? 'clean' : 'ready',
-          selected,
-          hostCompat: viaDirectory ? 'dir' : 'session',
-          notice: body.fetch
-            ? body.fetch.ok
-              ? options.t?.('fetchOk', { remote: body.fetch.remote }) ?? null
-              : options.t?.('fetchFailed', { remote: body.fetch.remote, message: body.fetch.message ?? '' }) ?? null
-            : store.get().notice,
-          // Auto-detected per project: a Perforce workspace that cannot be
-          // reached asks for its connection; anything else closes a panel the
-          // plugin itself opened.
-          ...(connectionPromptPatch(body, store.get()) ?? {}),
-        })
-      } catch (cause) {
-        if (token !== generation) return
-        store.set({
-          phase: 'error',
-          error:
-            cause.status === 403 && cause.body?.allowed
-              ? `${cause.message}\n${cause.body.allowed.join('  ')}`
-              : cause.message,
-        })
-      } finally {
-        if (token === generation) store.set({ busy: false })
+      const inFlightKey = `${targetKey(snapshot.target)}\u0000${snapshot.vcs}\u0000${options.fetchRemote ? 'fetch' : 'read'}`
+      // A read may only be shared while it is still the current generation: a
+      // target switch bumped it, and the old promise will discard its own answer.
+      if (!options.force && stateInFlight?.key === inFlightKey && stateInFlight.token === generation) {
+        return stateInFlight.promise
       }
+      const token = ++generation
+      // A state read replaces the list, so any comparison still in flight would
+      // be answering about a list that no longer exists.
+      diffGeneration++
+      store.set({ busy: true })
+      let loaded = false
+      const promise = (async () => {
+        try {
+          const extra = {
+            ...(options.fetchRemote ? { fetch: '1', remote: options.remote ?? 'origin' } : {}),
+            ...requestExtra(store.get(), { localEdits: true }),
+          }
+          const { body, viaDirectory } = await requestTarget('state', query, snapshot.target, extra)
+          if (token !== generation) return
+          const files = Array.isArray(body.files) ? body.files : []
+          const selected =
+            snapshot.selected && files.some((file) => file.path === snapshot.selected)
+              ? snapshot.selected
+              : files.length > 0
+                ? files[0].path
+                : null
+          store.set({
+            state: body,
+            error: body.ok === false ? body.message ?? null : null,
+            phase: body.ok === false ? 'error' : files.length === 0 ? 'clean' : 'ready',
+            selected,
+            hostCompat: viaDirectory ? 'dir' : 'session',
+            // A fetch result belongs to this answer only; keeping an older
+            // notice is how "Fetched origin" used to stay on screen forever.
+            notice: body.fetch
+              ? body.fetch.ok
+                ? options.t?.('fetchOk', { remote: body.fetch.remote }) ?? null
+                : options.t?.('fetchFailed', { remote: body.fetch.remote, message: body.fetch.message ?? '' }) ?? null
+              : null,
+            // Auto-detected per project: a Perforce workspace that cannot be
+            // reached asks for its connection; anything else closes a panel the
+            // plugin itself opened.
+            ...(connectionPromptPatch(body, store.get()) ?? {}),
+          })
+          loaded = true
+        } catch (cause) {
+          if (token !== generation) return
+          store.set({
+            phase: 'error',
+            error:
+              cause.status === 403 && cause.body?.allowed
+                ? `${cause.message}\n${cause.body.allowed.join('  ')}`
+                : cause.message,
+          })
+        } finally {
+          if (stateInFlight?.token === token) stateInFlight = null
+          if (token === generation) store.set({ busy: false })
+        }
+        // The refresh may have re-picked the selected file (first file of the new
+        // list), so the comparison has to follow it. Without this the pane kept
+        // the previous file's text while its header showed the new path.
+        if (loaded && token === generation) await loadDiff(options.t)
+      })()
+      stateInFlight = { key: inFlightKey, token, promise }
+      return promise
     }
 
+    // One comparison in flight per (target, file, base). The state refresh and the
+    // click that selected the file both ask; they share one request.
+    let diffInFlight = null
+
     async function loadDiff(t) {
+      const tr = typeof t === 'function' ? t : fallbackTranslator
       const snapshot = store.get()
       const query = targetQuery(snapshot)
-      if (!query || !snapshot.selected) return
-      const token = generation
+      const wanted = snapshot.selected
+      if (!query || !wanted) return
+      const key = `${targetKey(snapshot.target)}\u0000${wanted}\u0000${snapshot.state?.base ?? ''}\u0000${snapshot.vcs}`
+      // Same rule as the state read: only share a comparison while no newer read
+      // was requested. A stale answer would otherwise be returned to a caller
+      // that is looking at a newer file.
+      if (diffInFlight?.key === key && diffInFlight.token === diffGeneration) return diffInFlight.promise
+      // A per-file token, independent of target switches: clicking a second file
+      // must cancel the first answer even though no target changed.
+      const token = ++diffGeneration
       store.set({ diffPhase: 'loading' })
-      try {
-        const extra = { path: snapshot.selected }
-        if (snapshot.state?.base) extra.base = snapshot.state.base
-        Object.assign(extra, requestExtra(store.get()))
-        // A Perforce file needs its own coordinates: the depot path reaches the
-        // shelved/opened revision, the change number and the flags tell the Host
-        // which comparison was asked for. Git (and an older Host) never sees these.
-        if (backendOf(snapshot.state) === 'P4') {
-          const files = Array.isArray(snapshot.state?.files) ? snapshot.state.files : []
-          const file = files.find((entry) => entry?.path === snapshot.selected)
-          if (file) {
-            if (file.depotPath) extra.depotPath = file.depotPath
-            if (file.change !== undefined && file.change !== null) extra.change = String(file.change)
-            if (file.shelved === true) extra.shelved = '1'
-            if (file.untracked === true || file.origin === 'local') extra.changed = '1'
+      const promise = (async () => {
+        try {
+          const extra = { path: wanted }
+          if (snapshot.state?.base) extra.base = snapshot.state.base
+          Object.assign(extra, requestExtra(store.get()))
+          // A Perforce file needs its own coordinates: the depot path reaches the
+          // shelved/opened revision, the change number and the flags tell the Host
+          // which comparison was asked for. Git (and an older Host) never sees these.
+          if (backendOf(snapshot.state) === 'P4') {
+            const files = Array.isArray(snapshot.state?.files) ? snapshot.state.files : []
+            const file = files.find((entry) => entry?.path === wanted)
+            if (file) {
+              if (file.depotPath) extra.depotPath = file.depotPath
+              if (file.change !== undefined && file.change !== null) extra.change = String(file.change)
+              if (file.shelved === true) extra.shelved = '1'
+              if (file.untracked === true || file.origin === 'local') extra.changed = '1'
+              // Naming the comparison keeps the Host from guessing between the
+              // opened, shelved and local revisions of the same file.
+              if (file.origin) extra.origin = file.origin
+              if (file.p4Type) extra.p4Type = file.p4Type
+              if (typeof file.headRev === 'number') extra.baseRev = String(file.headRev)
+            }
           }
+          const { body } = await requestTarget('diff', query, snapshot.target, extra)
+          // The reader may have clicked another file while this was in flight.
+          if (token !== diffGeneration || store.get().selected !== wanted) return
+          store.set({ diff: body, diffPhase: 'ready' })
+        } catch (cause) {
+          if (token !== diffGeneration || store.get().selected !== wanted) return
+          store.set({
+            diff: { path: wanted, message: tr('error', { message: cause.message }), text: '' },
+            diffPhase: 'error',
+          })
+        } finally {
+          if (diffInFlight?.token === token) diffInFlight = null
         }
-        const { body } = await requestTarget('diff', query, snapshot.target, extra)
-        if (token !== generation) return
-        store.set({ diff: body, diffPhase: 'ready' })
-      } catch (cause) {
-        if (token !== generation) return
-        store.set({
-          diff: { path: snapshot.selected, message: t('error', { message: cause.message }), text: '' },
-          diffPhase: 'error',
-        })
-      }
+      })()
+      diffInFlight = { key, token, promise }
+      return promise
     }
 
     /** Point the store at one target and (re)load everything for it. */
     function selectTarget(target, t, options = {}) {
       if (!target) return
+      const nextVcs = rememberedVcs(target)
+      const current = store.get()
+      // A chip remount (or a second mounted chip) points at the target the store
+      // already holds. Clearing the list there would flash a skeleton and race
+      // the read the reader just triggered, so only the data is refreshed.
+      if (current.target && targetKey(current.target) === targetKey(target) && current.vcs === nextVcs) {
+        return loadState({ ...options, t })
+      }
       generation++
       store.set({
         target,
@@ -787,7 +962,7 @@ window.__ModuleLoader__.load({
         // hand, that choice comes back; otherwise detection decides, so a git
         // project and a Perforce project in one window each get the right mode
         // without the reader saying so.
-        vcs: rememberedVcs(target),
+        vcs: nextVcs,
         state: null,
         diff: null,
         diffPhase: 'idle',
@@ -801,7 +976,7 @@ window.__ModuleLoader__.load({
         panelAuto: false,
       })
       if (target.kind !== 'session' && target.dir) remember(target.dir)
-      return loadState({ ...options, t }).then(() => loadDiff(t))
+      return loadState({ ...options, t })
     }
 
     /**
@@ -816,7 +991,7 @@ window.__ModuleLoader__.load({
       if (next === current.vcs) return
       generation++
       store.set({ vcs: next, state: null, diff: null, diffPhase: 'idle', selected: null, phase: 'loading', error: null })
-      void loadState({ t }).then(() => loadDiff(t))
+      void loadState({ t })
     }
 
     /** Short backend marker used on the chip and in the summary header. */
@@ -918,6 +1093,12 @@ window.__ModuleLoader__.load({
       const { file, active, onSelect } = props
       const t = typeof props.t === 'function' ? props.t : fallbackTranslator
       const shelved = file.shelved === true
+      const parts = pathParts(file.path)
+      const tooltip = file.oldPath
+        ? `${file.oldPath} → ${file.path}`
+        : file.untracked
+          ? `${file.path} (${t('untracked')})`
+          : file.path
       return h(
         'button',
         {
@@ -925,10 +1106,19 @@ window.__ModuleLoader__.load({
           className: `dshCl_row${active ? ' dshCl_rowActive' : ''}${shelved ? ' dshCl_rowShelved' : ''}`,
           'data-origin': file.origin ?? undefined,
           onClick: () => onSelect(file.path),
-          title: file.oldPath ? `${file.oldPath} → ${file.path}` : file.untracked ? `${file.path} (${t('untracked')})` : file.path,
+          onDoubleClick: () => {
+            if (copyText(file.path)) flashNotice(t('copiedPath'))
+            else flashNotice(t('copyFailed'))
+          },
+          title: `${tooltip}\n${t('copyHint')}`,
         },
         h('span', { className: `dshCl_status ${STATUS_CLASS[file.status] ?? 'dshCl_sM'}` }, file.status),
-        h('span', { className: 'dshCl_path' }, file.path),
+        h(
+          'span',
+          { className: 'dshCl_path' },
+          parts.dir ? h('span', { className: 'dshCl_pathDir' }, parts.dir) : null,
+          h('span', { className: 'dshCl_pathName' }, parts.name),
+        ),
         // A shelved file stays visually distinct; a file that is both opened and
         // shelved shows the action badge *and* the shelved badge.
         file.action ? h('span', { className: 'dshCl_badge', title: file.depotPath ?? '' }, file.action) : null,
@@ -1128,6 +1318,9 @@ window.__ModuleLoader__.load({
       if (phase === 'loading') return h('div', { className: 'dshCl_center' }, t('loadingDiff'))
       if (phase === 'error') return h('div', { className: 'dshCl_center dshCl_error' }, diff?.message ?? t('missing'))
       if (!diff || diff.missing) return h('div', { className: 'dshCl_center' }, t('missing'))
+      // A comparison that belongs to another file must never be rendered under
+      // this header: while the Host answers for the new selection, show loading.
+      if (diff.path !== path) return h('div', { className: 'dshCl_center' }, t('loadingDiff'))
       if (diff.binary) return h('div', { className: 'dshCl_center' }, t('binary'))
 
       const lines = String(diff.text ?? '').split('\n')
@@ -1146,7 +1339,9 @@ window.__ModuleLoader__.load({
         ),
         h(
           'div',
-          { className: 'dshCl_diffBody' },
+          // Re-mounting on selection change resets the scroll position, so the
+          // next file starts at its first line instead of line 800.
+          { className: 'dshCl_diffBody', key: path },
           h(
             'pre',
             { className: 'dshCl_pre' },
@@ -1219,7 +1414,15 @@ window.__ModuleLoader__.load({
             ? t('p4Unavailable')
             : t('notRepo')
 
-      if (phase === 'loading') return h('div', { className: 'dshCl_body' }, picker, h('div', { className: 'dshCl_center' }, t('loading')))
+      if (phase === 'loading') {
+        return h(
+          'div',
+          { className: 'dshCl_body' },
+          picker,
+          h('div', { className: 'dshCl_list' }, skeletonRows(4)),
+          h('div', { className: 'dshCl_center' }, t('loading')),
+        )
+      }
       if (phase === 'empty') {
         return h('div', { className: 'dshCl_body' }, picker, h('div', { className: 'dshCl_center' }, error ?? t('noTargets')))
       }
@@ -1267,8 +1470,22 @@ window.__ModuleLoader__.load({
         const onKey = (event) => {
           if (event.key === 'Escape') store.set({ open: false })
         }
+        // Clicking anywhere outside the summary (or the chip that opens it)
+        // closes it, like every other floating surface in the app.
+        const onPointerDown = (event) => {
+          const target = event?.target
+          if (typeof target?.closest === 'function' && (target.closest('.dshCl_pop') || target.closest('.dshCl_chip'))) {
+            return
+          }
+          store.set({ open: false })
+        }
         window.addEventListener('keydown', onKey)
-        return () => window.removeEventListener('keydown', onKey)
+        const canWatchDocument = typeof document !== 'undefined' && typeof document.addEventListener === 'function'
+        if (canWatchDocument) document.addEventListener('pointerdown', onPointerDown, true)
+        return () => {
+          window.removeEventListener('keydown', onKey)
+          if (canWatchDocument) document.removeEventListener('pointerdown', onPointerDown, true)
+        }
       }, [open])
 
       if (!open) return null
@@ -1278,6 +1495,9 @@ window.__ModuleLoader__.load({
       // The directory stays on screen: "not a repository" must never be a
       // mystery about which folder was inspected.
       const targetDir = state?.dir ?? snapshot.target?.dir ?? ''
+      // Freshness is part of the answer: a count with no timestamp is either
+      // trusted too much or not at all.
+      const updated = clockOf(state?.generatedAt)
       // Anchored under the chip when it could be measured; otherwise the
       // stylesheet's default corner placement applies.
       const placement = anchor
@@ -1293,6 +1513,9 @@ window.__ModuleLoader__.load({
           'div',
           { className: 'dshCl_head' },
           h('h3', { className: 'dshCl_title' }, t('panel')),
+          updated
+            ? h('span', { className: 'dshCl_stamp', title: `${t('updatedAt', { time: updated })} · ${targetDir}` }, t('updatedAt', { time: updated }))
+            : null,
           // 自动 / git / Perforce. The choice is a request parameter only: the
           // session target still outranks it and any remembered directory.
           h(
@@ -1373,7 +1596,7 @@ window.__ModuleLoader__.load({
               t,
               snapshot,
               onApply: () => {
-                void loadState({ t }).then(() => loadDiff(t))
+                void loadState({ t })
               },
             })
           : null,

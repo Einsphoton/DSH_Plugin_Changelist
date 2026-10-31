@@ -701,6 +701,12 @@ export function createRoutes(ctx, config = {}, deps = {}) {
         change: query.get('change') || null,
         shelved: query.get('shelved') === '1',
         changed: query.get('changed') === '1',
+        // The comparison the reader asked for, so the Host does not have to
+        // guess between opened / shelved / local content. A file type is used
+        // for the binary decision, and the base revision for a deleted file.
+        origin: query.get('origin') || null,
+        p4Type: query.get('p4Type') || null,
+        baseRev: query.get('baseRev') || null,
         limits: p4Limits(),
       })
       return json({ ...diff, vcs: 'p4', base: diff.base ?? 'depot head' })
@@ -746,54 +752,95 @@ export function apply(ctx, config = {}, deps = {}) {
   const routes = createRoutes(ctx, config, deps)
   const { record } = routes.diagnostics
 
+  // Two chips (or an open racing a refresh) can ask the same question in the
+  // same tick. One read answers all of them: the activity log showed four
+  // identical state reads in flight at once, each spawning its own git/p4
+  // commands. The entry is removed as soon as the first answer is ready.
+  const inFlight = new Map()
+
+  /** Diagnostics are best effort: a slow log must never delay an answer. */
+  const log = (entry) => {
+    try {
+      const pending = record(entry)
+      if (pending && typeof pending.catch === 'function') pending.catch(() => {})
+    } catch {
+      /* a broken log is not a broken route */
+    }
+  }
+
   /** Wrap one route so every answer (and every failure) lands in the activity log. */
   const guard = (name, handler) => async (request) => {
     const started = Date.now()
     let query = null
+    let key = name
     try {
-      query = new URL(request.url).searchParams
+      const url = new URL(request.url)
+      query = url.searchParams
+      key = `${name}\u0000${url.pathname}\u0000${url.search}`
     } catch {
       query = null
     }
-    try {
-      const response = await handler(request)
-      let detail = {}
+    const pending = inFlight.get(key)
+    if (pending) {
+      // Share the first read's answer. A Response body is consumed once, so the
+      // caller gets a fresh Response over the same text.
+      const shared = await pending
       try {
-        const body = await response.clone().json()
-        const fromTarget = typeof body.target?.dir === 'string' && body.target.dir !== '' ? body.target.dir : undefined
-        detail = {
-          ok: body.ok,
-          vcs: body.vcs,
-          files: Array.isArray(body.files) ? body.files.length : undefined,
-          base: body.base,
-          reason: body.reason,
-          gitDetail: body.detail ?? undefined,
-          targets: Array.isArray(body.targets) ? body.targets.length : undefined,
-          dirs: Array.isArray(body.targets) ? body.targets.slice(0, 6).map((entry) => entry.dir) : undefined,
-          // The directory the answer is actually about. A `sessionId` request
-          // carries no `dir` in the URL, so without body.dir a switch between
-          // projects is indistinguishable in the log — which is exactly the
-          // question when the panel seems not to follow the session.
-          resolved: typeof body.dir === 'string' ? body.dir : fromTarget,
-        }
+        return new Response(shared.body, { status: shared.status, headers: shared.headers })
       } catch {
-        detail = {}
+        return new Response(shared.body, { status: shared.status })
       }
-      await record({
-        event: 'route',
-        route: name,
-        status: response.status,
-        ms: Date.now() - started,
-        sessionId: query?.get('sessionId') ?? undefined,
-        dir: query?.get('dir') ?? undefined,
-        ...detail,
-      })
-      return response
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
-      ctx.logger?.warn?.('changelist: route failed: %s', message)
-      await record({ event: 'route', route: name, status: 500, ms: Date.now() - started, error: message })
-      return json({ ok: false, message }, 500)
+    }
+    const answer = (async () => {
+      try {
+        const response = await handler(request)
+        const bodyText = await response.text()
+        let detail = {}
+        try {
+          const body = JSON.parse(bodyText)
+          const fromTarget = typeof body.target?.dir === 'string' && body.target.dir !== '' ? body.target.dir : undefined
+          detail = {
+            ok: body.ok,
+            vcs: body.vcs,
+            files: Array.isArray(body.files) ? body.files.length : undefined,
+            base: body.base,
+            reason: body.reason,
+            gitDetail: body.detail ?? undefined,
+            targets: Array.isArray(body.targets) ? body.targets.length : undefined,
+            dirs: Array.isArray(body.targets) ? body.targets.slice(0, 6).map((entry) => entry.dir) : undefined,
+            // The directory the answer is actually about. A `sessionId` request
+            // carries no `dir` in the URL, so without body.dir a switch between
+            // projects is indistinguishable in the log — which is exactly the
+            // question when the panel seems not to follow the session.
+            resolved: typeof body.dir === 'string' ? body.dir : fromTarget,
+          }
+        } catch {
+          detail = {}
+        }
+        log({
+          event: 'route',
+          route: name,
+          status: response.status,
+          ms: Date.now() - started,
+          sessionId: query?.get('sessionId') ?? undefined,
+          dir: query?.get('dir') ?? undefined,
+          ...detail,
+        })
+        return { body: bodyText, status: response.status, headers: response.headers }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        ctx.logger?.warn?.('changelist: route failed: %s', message)
+        log({ event: 'route', route: name, status: 500, ms: Date.now() - started, error: message })
+        const fallback = json({ ok: false, message }, 500)
+        return { body: await fallback.text(), status: 500, headers: fallback.headers }
+      }
+    })()
+    inFlight.set(key, answer)
+    try {
+      const shared = await answer
+      return new Response(shared.body, { status: shared.status, headers: shared.headers })
+    } finally {
+      inFlight.delete(key)
     }
   }
 

@@ -68,6 +68,7 @@ const React = {
 }
 
 const styleTags = []
+const documentListeners = { pointerdown: new Set() }
 const document = {
   head: {
     appendChild(tag) {
@@ -79,6 +80,13 @@ const document = {
   },
   createElement() {
     return { dataset: {}, textContent: '', remove() {} }
+  },
+  addEventListener(type, handler) {
+    if (!documentListeners[type]) documentListeners[type] = new Set()
+    documentListeners[type].add(handler)
+  },
+  removeEventListener(type, handler) {
+    documentListeners[type]?.delete(handler)
   },
 }
 
@@ -129,10 +137,24 @@ const diffPayload = {
 
 const fetchStub = async (url) => {
   requests.push(String(url))
+  // A comparison can be held open, so the race between two quick clicks is
+  // testable instead of depending on network timing. The same goes for one
+  // held-back state read.
+  if (String(url).includes('.diff')) {
+    const gate = diffGates.get(parseQuery(url).path)
+    if (gate) await gate.promise
+  }
+  if (String(url).includes('.state')) {
+    const sessionId = parseQuery(url).sessionId
+    const gate = sessionId ? stateGates.get(sessionId) : null
+    if (gate) {
+      stateGates.delete(sessionId)
+      await gate.promise
+    }
+  }
   // Optional fault injection: reject the sessionId form once, as an older host
   // half would, so the client's `dir` fallback can be exercised.
-  if (rejectSessionId && String(url).includes('sessionId=')) {
-    return {
+  if (rejectSessionId && String(url).includes('sessionId=')) {    return {
       ok: false,
       status: 400,
       async json() {
@@ -168,7 +190,12 @@ const fetchStub = async (url) => {
       },
     }
   }
-  const body = String(url).includes('.targets') ? targetsPayload : String(url).includes('.diff') ? diffPayload : statePayload
+  const body =
+    String(url).includes('.targets')
+      ? targetsPayload
+      : String(url).includes('.diff')
+        ? (diffByPath.get(parseQuery(url).path) ?? diffPayload)
+        : (gitStatePayload ?? statePayload)
   return {
     ok: true,
     status: 200,
@@ -180,6 +207,20 @@ const fetchStub = async (url) => {
 let rejectSessionId = false
 let stateFails = false
 let p4StatePayload = null
+// Per-test overrides for the sections that need the list (or one comparison) to
+// change between reads. The default payloads above stay in charge of everything
+// before them.
+let gitStatePayload = null
+const diffByPath = new Map()
+const diffGates = new Map()
+const stateGates = new Map()
+function deferred() {
+  let resolve
+  const promise = new Promise((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
 
 const localStorageStore = new Map()
 const keyHandlers = new Set()
@@ -653,7 +694,16 @@ function byClass(node, cls) {
 }
 function rowPath(row) {
   const pathNode = byClass(row, 'dshCl_path')[0]
-  return pathNode ? collectText(pathNode) : null
+  if (!pathNode) return null
+  // A row keeps the directory and the file name in two spans: the directory
+  // shrinks first, so the name stays readable. The path is their concatenation.
+  const dir = byClass(pathNode, 'dshCl_pathDir')
+    .map((node) => collectText(node))
+    .join('')
+  const name = byClass(pathNode, 'dshCl_pathName')
+    .map((node) => collectText(node))
+    .join('')
+  return dir.length > 0 || name.length > 0 ? `${dir}${name}` : collectText(pathNode)
 }
 function groupPaths(group) {
   const box = group ? byClass(group, 'dshCl_groupFiles')[0] : null
@@ -1271,6 +1321,214 @@ checkThat(
 )
 void againChip
 localStorageStore.set(VCS_KEY, 'auto')
+
+console.log('14e. a refresh re-reads the comparison for the file it re-selects')
+// A fresh instance owns a clean store for the next three sections.
+{
+  // The section above leaves a Perforce-shaped answer and a per-target backend
+  // choice behind; this section is about git, so both are reset first.
+  p4StatePayload = null
+  for (const key of [...localStorageStore.keys()]) {
+    if (key.startsWith(`${VCS_KEY}.`)) localStorageStore.delete(key)
+  }
+  localStorageStore.set(VCS_KEY, 'auto')
+  const fileA = { path: 'src/a.js', status: 'M', added: 1, deleted: 0, binary: false, untracked: false, oldPath: null }
+  const fileRenamed = {
+    path: 'src/new name.js',
+    status: 'R',
+    added: 0,
+    deleted: 0,
+    binary: false,
+    untracked: false,
+    oldPath: 'src/old name.js',
+  }
+  const fileBinary = { path: 'blob.bin', status: 'A', added: null, deleted: 0, binary: true, untracked: true, oldPath: null }
+  gitStatePayload = { ...statePayload, total: 3, files: [fileRenamed, fileA, fileBinary] }
+  diffByPath.set('src/new name.js', {
+    ok: true,
+    path: 'src/new name.js',
+    base: 'origin/main',
+    binary: false,
+    truncated: false,
+    text: 'diff --git a/src/new name.js b/src/new name.js\n@@ -0,0 +1,1 @@\n+renamed content',
+  })
+
+  const followMod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  const beforeFollow = registered.length
+  followMod.apply(ctx)
+  const followEntries = registered.slice(beforeFollow)
+  const followChip = followEntries.find((entry) => entry.id === 'changelist.chip')
+  const followPopover = followEntries.find((entry) => entry.id === 'changelist.popover')
+  checkThat('the follow fixture registered both surfaces', Boolean(followChip && followPopover), JSON.stringify(followEntries.map((entry) => entry.id)))
+
+  const openFor = async (id) => {
+    hookQueue.length = 0
+    const chipTree = expand(React.createElement(followChip.component, { t, getViewedSessionId: () => id }))
+    await settle()
+    if (byClass(expand(React.createElement(followPopover.component, { t })), 'dshCl_pop').length === 0) {
+      const button = find(chipTree, (node) => typeof node.props?.onClick === 'function' && String(node.props.className).includes('dshCl_chip'))
+      button?.props?.onClick?.({ currentTarget: { getBoundingClientRect: () => ({ top: 20, bottom: 48, right: 900 }) } })
+      await settle()
+    }
+    hookQueue.length = 0
+    return expand(React.createElement(followPopover.component, { t }))
+  }
+
+  let followPop = await openFor(SESSION_ID)
+  const activeRow = () => byClass(followPop, 'dshCl_rowActive')[0]
+  check('the first file of the list is selected', activeRow() ? rowPath(activeRow()) : null, 'src/new name.js')
+  checkThat('its comparison is on screen', collectText(byClass(followPop, 'dshCl_diffHead')[0] ?? null).includes('src/new name.js'), collectText(followPop).slice(0, 200))
+  const splitRow = byClass(followPop, 'dshCl_row')[0]
+  check(
+    'a row splits the directory from the file name',
+    [byClass(splitRow, 'dshCl_pathDir').length, byClass(splitRow, 'dshCl_pathName').length],
+    [1, 1],
+  )
+  checkThat('a row offers double-click copy', typeof splitRow?.props?.onDoubleClick === 'function', String(typeof splitRow?.props?.onDoubleClick))
+
+  // A later read no longer contains the selected file: the selection has to move
+  // to the first file of the new list, the comparison has to follow it, and the
+  // old file's text must not linger under the new path.
+  gitStatePayload = { ...statePayload, total: 2, files: [fileA, fileBinary] }
+  diffByPath.set('src/a.js', {
+    ok: true,
+    path: 'src/a.js',
+    base: 'origin/main',
+    binary: false,
+    truncated: false,
+    text: 'diff --git a/src/a.js b/src/a.js\n@@ -1 +1,2 @@\n export const a = 1\n+refreshed a',
+  })
+  requests.length = 0
+  const refreshButton = find(
+    followPop,
+    (node) => node.type === 'button' && String(node.props?.className).includes('dshCl_btn') && collectText(node) === '刷新',
+  )
+  checkThat('the refresh control is on screen', refreshButton !== null, collectClasses(followPop).slice(0, 200))
+  refreshButton?.props?.onClick?.()
+  await settle()
+  hookQueue.length = 0
+  followPop = expand(React.createElement(followPopover.component, { t }))
+  check('the re-picked file is the new first file', activeRow() ? rowPath(activeRow()) : null, 'src/a.js')
+  const followDiffQueries = requests.filter((url) => url.includes('.diff')).map(parseQuery)
+  check('the comparison was re-read for it', followDiffQueries.at(-1)?.path, 'src/a.js')
+  checkThat('and the pane shows its content', collectText(followPop).includes('refreshed a'), collectText(followPop).slice(-300))
+  check('not the previous file’s content', collectText(followPop).includes('renamed content'), false)
+
+  // Double-clicking a row copies its path and says so.
+  const copyRow = byClass(followPop, 'dshCl_row')[0]
+  copyRow?.props?.onDoubleClick?.()
+  hookQueue.length = 0
+  followPop = expand(React.createElement(followPopover.component, { t }))
+  checkThat('copying a path reports back in the summary', /复制|路径/.test(collectText(followPop)), collectText(followPop).slice(-200))
+
+  console.log('14f. a late comparison cannot overwrite the newer file')
+  // Hold the a.js answer open, click b.js while it is in flight, then let the
+  // stale answer land. The pane must still show b.js.
+  diffByPath.set('src/a.js', {
+    ok: true,
+    path: 'src/a.js',
+    base: 'origin/main',
+    binary: false,
+    truncated: false,
+    text: 'STALE-A',
+  })
+  diffByPath.set('blob.bin', { ok: true, path: 'blob.bin', base: 'origin/main', binary: true, truncated: false, text: '' })
+  const gate = deferred()
+  diffGates.set('src/a.js', gate)
+  hookQueue.length = 0
+  let racePop = expand(React.createElement(followPopover.component, { t }))
+  const raceRows = byClass(racePop, 'dshCl_row')
+  const staleRow = raceRows.find((row) => rowPath(row) === 'src/a.js')
+  const newerRow = raceRows.find((row) => rowPath(row) === 'blob.bin')
+  checkThat('both rows are on screen', Boolean(staleRow && newerRow), JSON.stringify(raceRows.map(rowPath)))
+  staleRow?.props?.onClick?.()
+  await settle()
+  newerRow?.props?.onClick?.()
+  await settle()
+  gate.resolve()
+  diffGates.delete('src/a.js')
+  await settle()
+  await settle()
+  hookQueue.length = 0
+  racePop = expand(React.createElement(followPopover.component, { t }))
+  const raceActive = byClass(racePop, 'dshCl_rowActive')[0]
+  check('the latest click owns the selection', raceActive ? rowPath(raceActive) : null, 'blob.bin')
+  check('the earlier answer never lands under it', collectText(racePop).includes('STALE-A'), false)
+  checkThat('and the binary placeholder is shown', collectText(racePop).includes('二进制'), collectText(racePop).slice(-200))
+
+  console.log('14g. a click outside closes the summary')
+  const watchList = [...(documentListeners.pointerdown ?? [])]
+  const watch = watchList.at(-1)
+  checkThat('an outside-click watcher is attached while open', typeof watch === 'function', String(watchList.length))
+  watch?.({ target: { closest: (selector) => (selector === '.dshCl_pop' ? {} : null) } })
+  hookQueue.length = 0
+  checkThat('a click inside the summary leaves it open', byClass(expand(React.createElement(followPopover.component, { t })), 'dshCl_pop').length === 1, '')
+  watch?.({ target: { closest: () => null } })
+  hookQueue.length = 0
+  checkThat('a click elsewhere closes it', byClass(expand(React.createElement(followPopover.component, { t })), 'dshCl_pop').length === 0, '')
+
+  gitStatePayload = null
+  diffByPath.clear()
+  diffGates.clear()
+}
+
+console.log('14h. a superseded read is never reused after switching back')
+// A read that was overtaken by a target switch must not be handed to a caller
+// that switched back: its answer is discarded by its own token, so the caller
+// would stay on the skeleton forever. A fresh instance owns this store.
+{
+  p4StatePayload = null
+  for (const key of [...localStorageStore.keys()]) {
+    if (key.startsWith(`${VCS_KEY}.`)) localStorageStore.delete(key)
+  }
+  localStorageStore.set(VCS_KEY, 'auto')
+  const raceMod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  const beforeRace = registered.length
+  raceMod.apply(ctx)
+  const raceEntries = registered.slice(beforeRace)
+  const raceChip = raceEntries.find((entry) => entry.id === 'changelist.chip')
+  const racePopover = raceEntries.find((entry) => entry.id === 'changelist.popover')
+  checkThat('the switch fixture registered both surfaces', Boolean(raceChip && racePopover), JSON.stringify(raceEntries.map((entry) => entry.id)))
+
+  const openRace = async (id) => {
+    hookQueue.length = 0
+    const chipTree = expand(React.createElement(raceChip.component, { t, getViewedSessionId: () => id }))
+    await settle()
+    if (byClass(expand(React.createElement(racePopover.component, { t })), 'dshCl_pop').length === 0) {
+      const button = find(chipTree, (node) => typeof node.props?.onClick === 'function' && String(node.props.className).includes('dshCl_chip'))
+      button?.props?.onClick?.({ currentTarget: { getBoundingClientRect: () => ({ top: 20, bottom: 48, right: 900 }) } })
+      await settle()
+    }
+    hookQueue.length = 0
+    return expand(React.createElement(racePopover.component, { t }))
+  }
+
+  const gate = deferred()
+  stateGates.set(SESSION_ID, gate)
+  await openRace(SESSION_ID) // the first read for the session is held open
+  await openRace('another-session') // the target moves away
+  await openRace(SESSION_ID) // and back again while the first answer is in flight
+  await settle()
+  gate.resolve()
+  stateGates.delete(SESSION_ID)
+  await settle()
+  await settle()
+  hookQueue.length = 0
+  const backPop = expand(React.createElement(racePopover.component, { t }))
+  check('the list is loaded after switching back', byClass(backPop, 'dshCl_row').length, 3)
+  checkThat(
+    'the answer belongs to the session again',
+    collectText(byClass(backPop, 'dshCl_dir')[0] ?? null).includes(SESSION_DIR),
+    collectText(backPop).slice(0, 300),
+  )
+  check('the superseded answer did not replace it', collectText(backPop).includes('该目录不在 git 工作区内'), false)
+}
 
 console.log('15. the injected stylesheet carries the new surfaces')
 // There is no browser here to compute colours, so the class -> colour-token

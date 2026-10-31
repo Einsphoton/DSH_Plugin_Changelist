@@ -469,5 +469,83 @@ const overridden = await (
 check('a typed-in user overrides the discovered one', overridden.workspace?.user, 'typed-by-hand')
 check('a typed-in user also overrides it in the echoed panel values', overridden.options?.discovered?.user, 'typed-by-hand')
 
+console.log('7c. a forced backend never probes the other tool')
+// Forcing git on a git work tree must not spawn p4 at all: an unreachable
+// Perforce server used to add seconds to a plain git read.
+resetP4Calls()
+const probeRoutes = createRoutes(
+  ctx,
+  { allowedPaths: [repo], p4Path: FAKE_P4_SHIM, diagnostics: false },
+  {
+    execFile: (file, args, options, callback) =>
+      file === FAKE_P4_SHIM ? p4ExecFile(file, args, options, callback) : fileRedirectExecFile(file, args, options, callback),
+  },
+)
+const forcedGitOnGit = await (
+  await probeRoutes.handleState(new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(repo)}&vcs=git`))
+).json()
+check('forcing git on a git work tree answers from git', forcedGitOnGit.vcs, 'git')
+check('and spawns no p4 process at all', readP4Calls().length, 0)
+
+resetP4Calls()
+const autoOnGit = await (
+  await probeRoutes.handleState(new Request(`http://localhost/api/changelist.state?dir=${encodeURIComponent(repo)}&vcs=auto`))
+).json()
+check('auto detection still prefers git', autoOnGit.vcs, 'git')
+checkThat(
+  'auto still asks Perforce whether it also covers the directory',
+  readP4Calls().length > 0,
+  JSON.stringify(readP4Calls().slice(0, 2)),
+)
+
+console.log('7d. concurrent identical reads share one answer')
+// Four identical state reads used to run at once, each spawning its own git
+// commands. Mounted routes now coalesce them into one read.
+const coalesced = []
+const coalesceLog = path.join(FIXTURE_ROOT, 'diag', 'coalesce.log')
+fs.rmSync(coalesceLog, { force: true })
+const coalesceCtx = {
+  logger,
+  get: ctx.get,
+  effect(fn) {
+    const value = fn()
+    const disposers = typeof value === 'function' ? [value] : [...(value ?? [])]
+    void disposers
+    return () => {}
+  },
+  connection: {
+    fetch: {
+      register(route) {
+        coalesced.push(route)
+        return () => {}
+      },
+    },
+  },
+}
+apply(coalesceCtx, { allowedPaths: [repo], diagnosticsPath: coalesceLog }, { execFile: fileRedirectExecFile })
+const coalesceRoute = coalesced.find((route) => route.path === ROUTES.state)
+checkThat('the state route is mounted for the coalescing test', Boolean(coalesceRoute), JSON.stringify(coalesced.map((route) => route.path)))
+const coalesceUrl = `http://localhost${ROUTES.state}?sessionId=s1`
+const [firstAnswer, secondAnswer] = await Promise.all([
+  coalesceRoute.fetch(new Request(coalesceUrl)),
+  coalesceRoute.fetch(new Request(coalesceUrl)),
+])
+const [firstBody, secondBody] = await Promise.all([firstAnswer.json(), secondAnswer.json()])
+check('both concurrent callers get an answer', [firstAnswer.status, secondAnswer.status], [200, 200])
+const dottedRepo = repo.replace(/\\/g, '/')
+check(
+  'both answers describe the same read',
+  [firstBody.dir, firstBody.total, secondBody.dir, secondBody.total],
+  [dottedRepo, 6, dottedRepo, 6],
+)
+await new Promise((resolve) => setTimeout(resolve, 150))
+const routeLines = fs
+  .readFileSync(coalesceLog, 'utf8')
+  .trim()
+  .split('\n')
+  .map((line) => JSON.parse(line))
+  .filter((entry) => entry.event === 'route' && entry.route === 'state')
+check('two requests were answered by one read', routeLines.length, 1)
+
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)
