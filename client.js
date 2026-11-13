@@ -134,6 +134,7 @@ window.__ModuleLoader__.load({
       // ── attention（跨项目状态提示） ─────────────────────────────────────
       attentionPanel: '跨项目状态',
       attentionPillClear: '全部正常',
+      attentionPillUnknown: '状态未知',
       attentionPillWaiting: '{count} 待处理',
       attentionPillError: '{count} 出错',
       attentionPillDone: '{count} 已完成',
@@ -145,6 +146,10 @@ window.__ModuleLoader__.load({
       attentionQuietLine: '只在别的会话需要你时提醒，正在看的会话不打扰',
       attentionWatching: '监视全部会话 · 每 {seconds} 秒',
       attentionEmpty: '所有会话都正常。别的会话完成的、出错的、或等你确认的，都会出现在这里。',
+      attentionStaleRows: '以下是你最后一次读到的状态，可能已过期：',
+      attentionUnknownHint: '读不到会话状态：可能 Host 半边是旧版（缺 /api/changelist.attention）或刚才那次读取失败了',
+      attentionUnknownBody:
+        '读不到会话状态，所以这里既不能说「全部正常」，也不能说「有事」。\n最常见的原因是运行中的 Host 半边还是旧版：本 profile 的 HMR 不监听源码，改完插件要在 Plugins 页面把该 bundle 关掉再打开（或重启 DSH），新的 /api/changelist.attention 路由才会注册。',
       attentionOpen: '打开',
       attentionMarkAllRead: '全部标记已读',
       attentionUnknownWorkspace: '未知工作区',
@@ -265,6 +270,7 @@ window.__ModuleLoader__.load({
       // ── attention (cross-project status) ────────────────────────────────
       attentionPanel: 'All sessions',
       attentionPillClear: 'All clear',
+      attentionPillUnknown: 'Status unknown',
       attentionPillWaiting: '{count} need you',
       attentionPillError: '{count} failed',
       attentionPillDone: '{count} finished',
@@ -276,6 +282,10 @@ window.__ModuleLoader__.load({
       attentionQuietLine: 'Only speaks up for other sessions; the one you are reading stays quiet',
       attentionWatching: 'Watching every session · every {seconds}s',
       attentionEmpty: 'Every session is healthy. Completions, failures and pending questions from other sessions show up here.',
+      attentionStaleRows: 'Last known state below; it may be out of date:',
+      attentionUnknownHint: 'Cannot read session status: the Host half may be older (no /api/changelist.attention) or the last read failed',
+      attentionUnknownBody:
+        'Session status cannot be read, so this cannot honestly say "all clear" or "something needs you".\nThe usual cause is a running Host half from before this feature: HMR does not watch sources in this profile, so toggle the bundle off and on in the Plugins page (or restart DSH) to register the new /api/changelist.attention route.',
       attentionOpen: 'Open',
       attentionMarkAllRead: 'Mark all read',
       attentionUnknownWorkspace: 'Unknown workspace',
@@ -406,6 +416,12 @@ window.__ModuleLoader__.load({
       '.dshAt_dot[data-state=error]{background:var(--dsw-alias-state-error-primary,#e03131)}',
       '.dshAt_dot[data-state=done]{background:var(--dsw-alias-state-success-primary,#2f9e44)}',
       '.dshAt_dot[data-state=running]{background:var(--dsw-alias-state-business-primary,#4c6ef5)}',
+      /* "We cannot see" is its own state: neither a clean bill of health nor an
+         alarm. A hollow ring reads as "no information" at a glance. */
+      '.dshAt_dot[data-state=unknown]{background:transparent;box-shadow:inset 0 0 0 1.5px var(--dsw-alias-label-tertiary)}',
+      '.dshAt_pill[data-state=unknown] .dshAt_text{color:var(--dsw-alias-label-tertiary)}',
+      '.dshAt_emptyWarn{color:var(--dsw-alias-state-warn-primary,#bf8700);text-align:left;white-space:pre-wrap}',
+      '.dshAt_staleHead{padding:6px 10px 2px;color:var(--dsw-alias-label-tertiary);font-size:11px}',
       '.dshAt_text{min-width:0;overflow:hidden;text-overflow:ellipsis;font-family:var(--ds-font-family-code)}',
       '.dshAt_pill[data-state=waiting] .dshAt_text{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
       '.dshAt_pill[data-state=error] .dshAt_text{color:var(--dsw-alias-state-error-primary,#e03131)}',
@@ -1280,6 +1296,12 @@ window.__ModuleLoader__.load({
         generatedAt: null,
         /** False when the Host reports `enabled:false`: the feature is switched off. */
         enabled: true,
+        /**
+         * Whether the last read actually reached the Host. A failed read must
+         * never render as "all clear": silence about other agents' work is not
+         * evidence that it is done.
+         */
+        reachable: true,
         /** True once the reader has been shown the call-out for the current waiting set. */
         calloutSeen: false,
         waitingKey: '',
@@ -1433,6 +1455,8 @@ window.__ModuleLoader__.load({
           attention.set({
             sessions,
             enabled: !disabled,
+            // A successful answer re-establishes contact.
+            reachable: true,
             counts:
               !disabled && body.counts && typeof body.counts === 'object'
                 ? { ...previous.counts, ...body.counts }
@@ -1456,13 +1480,20 @@ window.__ModuleLoader__.load({
           return body
         } catch (cause) {
           // Attention is advisory: a failed read must never turn into an error
-          // banner over the reader's work. Keep the last known set in place.
+          // banner over the reader's work. But it must also never be reported as
+          // "all clear" — that is a claim about other agents' work, and a 404
+          // (older Host half without the route) or a dropped read knows nothing.
           attention.set({
             phase: attention.get().phase === 'idle' ? 'error' : attention.get().phase,
             error: cause?.message ?? null,
+            // Losing contact invalidates the counts; keep the rows so the reader
+            // still sees what was last known, but stop asserting freshness.
+            reachable: false,
           })
+          applyTitle(attentionSummary(attention.get()))
           return null
-        } finally {
+        }
+        finally {
           attentionInFlight = null
         }
       })()
@@ -2249,15 +2280,20 @@ window.__ModuleLoader__.load({
       // `attentionEnabled: false` on the Host means the reader turned this
       // feature off: claim no space in the sidebar at all.
       if (snapshot.enabled === false) return null
+      // A pill that cannot see must say so. Rendering "全部正常" after a failed
+      // read is the one lie this surface must never tell.
+      const blind = snapshot.reachable === false
       const label = rail
         ? ''
-        : worst === 'waiting'
-          ? t('attentionPillWaiting', { count: summary.counts.waiting })
-          : worst === 'error'
-            ? t('attentionPillError', { count: summary.counts.error })
-            : worst === 'done'
-              ? t('attentionPillDone', { count: summary.unread })
-              : t('attentionPillClear')
+        : blind
+          ? t('attentionPillUnknown')
+          : worst === 'waiting'
+            ? t('attentionPillWaiting', { count: summary.counts.waiting })
+            : worst === 'error'
+              ? t('attentionPillError', { count: summary.counts.error })
+              : worst === 'done'
+                ? t('attentionPillDone', { count: summary.unread })
+                : t('attentionPillClear')
 
       // The call-out is the "pointer": it says out loud that something above in
       // this list needs a click, and collapses once the reader has seen it.
@@ -2285,16 +2321,16 @@ window.__ModuleLoader__.load({
           {
             type: 'button',
             className: 'dshAt_pill',
-            'data-state': worst ?? 'clear',
+            'data-state': blind ? 'unknown' : worst ?? 'clear',
             'data-rail': rail ? 'true' : 'false',
             'aria-haspopup': 'dialog',
             'aria-expanded': snapshot.open ? 'true' : 'false',
             'aria-label': `${t('attentionPanel')} · ${label || t('attentionPillClear')}`,
-            title: `${t('attentionPanel')}\n${t('attentionQuietLine')}`,
+            title: `${t('attentionPanel')}\n${blind ? t('attentionUnknownHint') : t('attentionQuietLine')}`,
             onClick: openPanel,
           },
           worst === 'waiting' ? h('span', { className: 'dshAt_caret', 'aria-hidden': 'true' }, '▲') : null,
-          h('span', { className: 'dshAt_dot', 'data-state': worst ?? 'clear' }),
+          h('span', { className: 'dshAt_dot', 'data-state': blind ? 'unknown' : worst ?? 'clear' }),
           rail ? null : h('span', { className: 'dshAt_text' }, label),
         ),
         callout,
@@ -2369,8 +2405,19 @@ window.__ModuleLoader__.load({
         h(
           'div',
           { className: 'dshAt_body' },
+          // Losing contact outranks the last known rows: showing them alone
+          // would present stale state as current. The warning comes first and
+          // the rows stay below it, clearly demoted.
+          snapshot.reachable === false
+            ? h('div', { className: 'dshAt_empty dshAt_emptyWarn' }, t('attentionUnknownBody'))
+            : null,
+          snapshot.reachable === false && ordered.length > 0
+            ? h('div', { className: 'dshAt_staleHead' }, t('attentionStaleRows'))
+            : null,
           ordered.length === 0
-            ? h('div', { className: 'dshAt_empty' }, t('attentionEmpty'))
+            ? snapshot.reachable === false
+              ? null
+              : h('div', { className: 'dshAt_empty' }, t('attentionEmpty'))
             : groups.map((group) =>
                 h(
                   'div',

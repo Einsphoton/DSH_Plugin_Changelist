@@ -180,6 +180,15 @@ const fetchStub = async (url) => {
   // The attention route reports every session across every workspace. `null`
   // (the default) keeps the original payloads in charge, so every assertion
   // above sees exactly what it saw before.
+  if (String(url).includes('.attention') && rejectAttention) {
+    return {
+      ok: false,
+      status: 404,
+      async json() {
+        throw new Error('no body')
+      },
+    }
+  }
   if (attentionPayload !== null && String(url).includes('.attention')) {
     const body = attentionPayload
     return {
@@ -223,6 +232,9 @@ let p4StatePayload = null
 // The cross-project attention answer, driven only by the section that covers
 // it; `null` everywhere else keeps the older sections untouched.
 let attentionPayload = null
+// When true, the attention route answers the way a Host half from before this
+// feature does: 404, no body. Used to prove a failed read is not "all clear".
+let rejectAttention = false
 // Per-test overrides for the sections that need the list (or one comparison) to
 // change between reads. The default payloads above stay in charge of everything
 // before them.
@@ -1873,6 +1885,55 @@ check(
 )
 check('the error row renders once', byClass(wireTree, 'dshAt_row').length, 1)
 internals.store.set({ open: false })
+
+console.log('16h. a failed read is not "all clear"')
+// The pill reported "全部正常" when the attention route 404'd, because a failed
+// read was swallowed and rendered as an empty list. Silence about other agents'
+// work is not evidence that it finished.
+const failRegistered = []
+mod.apply({
+  effect(fn) {
+    void fn()
+  },
+  sessions: { open() {}, list: { getSnapshot: () => ({ byId: {} }) } },
+  locale: ctx.locale,
+  slots: {
+    inject(owner, register) {
+      void register()
+    },
+    register(options, component) {
+      failRegistered.push({ ...options, component })
+      return () => {}
+    },
+  },
+})
+const failPill = failRegistered.find((entry) => entry.id === 'changelist.attention.pill')
+const failPanel = failRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+// Force the next attention read to fail the way an old Host half does.
+const realPayload = attentionPayload
+attentionPayload = null
+const originalFetch = fetchStub
+rejectAttention = true
+hookQueue.length = 0
+expand(React.createElement(failPill.component, { t, wide: true }))
+await settle()
+hookQueue.length = 0
+const blindTree = expand(React.createElement(failPill.component, { t, wide: true }))
+check('the pill reports the unknown state', byClass(blindTree, 'dshAt_pill')[0]?.props['data-state'], 'unknown')
+checkThat('the pill does not claim everything is fine', !collectText(blindTree).includes('全部正常'), collectText(blindTree))
+checkThat('the pill says the status is unknown', collectText(blindTree).includes('未知'), collectText(blindTree))
+internals.store.set({ open: true, anchor: null })
+hookQueue.length = 0
+const blindPanel = expand(React.createElement(failPanel.component, { t }))
+checkThat('the panel explains why it cannot say', collectText(blindPanel).includes('读不到'), collectText(blindPanel).slice(0, 300))
+internals.store.set({ open: false })
+rejectAttention = false
+attentionPayload = realPayload
+// The pill's failed read may still be the shared in-flight promise; let it
+// settle so the next call starts a fresh request instead of reusing it.
+await settle()
+await internals.load({ t, silent: true })
+check('a successful read is reachable again', internals.store.get().reachable, true)
 
 console.log('17. the attention surfaces carry their own styling contract')
 checkThat('the pill has a rail (collapsed) variant', pluginCss.includes('.dshAt_pill[data-rail=true]'), 'no rail rule')

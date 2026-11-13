@@ -817,7 +817,11 @@ const attentionRouteCtx = {
     },
   },
 }
-apply(attentionRouteCtx, { allowedPaths: [repo], diagnostics: false, diagnosticsPath: attentionLog }, { execFile: fileRedirectExecFile })
+// An explicitly empty session store: these assertions describe a genuinely
+// quiet Host, so they must not inherit the fixture sessions the shared `ctx`
+// reports (a Host that HAS sessions correctly reports them — see 9b2).
+const EMPTY_SESSIONS = { list: () => [], get: () => undefined }
+apply(attentionRouteCtx, { allowedPaths: [repo], diagnostics: false, diagnosticsPath: attentionLog }, { execFile: fileRedirectExecFile, attentionSessions: EMPTY_SESSIONS })
 const attentionRoute = attentionRegistered.find((route) => route.path === ROUTES.attention)
 checkThat('the attention route is mounted with the other three', Boolean(attentionRoute), JSON.stringify(attentionRegistered.map((route) => route.path)))
 check('the mount is still four routes', attentionRegistered.length, 4)
@@ -875,7 +879,7 @@ const liveCtx = {
   },
   connection: { fetch: { register: (route) => (liveRoutes.push(route), () => {}) } },
 }
-apply(liveCtx, { allowedPaths: [repo], diagnostics: false }, { execFile: fileRedirectExecFile })
+apply(liveCtx, { allowedPaths: [repo], diagnostics: false }, { execFile: fileRedirectExecFile, attentionSessions: EMPTY_SESSIONS })
 check('the plugin subscribed to session/event', liveListeners.filter((entry) => entry.eventName === 'session/event').length, 1)
 check('the plugin mounted four routes', liveRoutes.length, 4)
 const liveAttentionRoute = liveRoutes.find((route) => route.path === ROUTES.attention)
@@ -929,6 +933,66 @@ check('and still carries no sessions', disabledBody.sessions, [])
 check('and still carries all five zeroed counts', disabledBody.counts, { waiting: 0, error: 0, done: 0, running: 0, idle: 0 })
 check('and still carries the schema version', disabledBody.schemaVersion, ATTENTION_SCHEMA_VERSION)
 check('the disabled route is still mounted', disabledRegistered.length, 4)
+
+// 9b2. A mount with pre-existing sessions must not report an empty world.
+// The registry used to learn only from events emitted AFTER it mounted, so a
+// remount (the normal way a changed Host half is picked up) claimed "all clear"
+// while agents were mid-turn. Seeding reads the store's event log instead.
+{
+  const seedNow = 1_700_000_000_000
+  const withLog = (id, cwd, events) => ({ id, header: { cwd }, ownEvents: () => events })
+  const liveNow = [
+    // Mid-turn at mount time -> must come back running, not idle.
+    withLog('seed-run', 'K:/w/Run', [{ type: 'turn/start', turn: 2, time: seedNow - 5_000 }]),
+    // Finished OK before the mount -> done, with the log's own timestamp.
+    withLog('seed-done', 'K:/w/Done', [
+      { type: 'turn/start', turn: 1, time: seedNow - 90_000 },
+      { type: 'turn/end', turn: 1, reason: { kind: 'completed' }, time: seedNow - 60_000 },
+    ]),
+    // Failed before the mount -> error, and the detail survives the replay.
+    withLog('seed-err', 'K:/w/Err', [
+      { type: 'turn/start', turn: 1, time: seedNow - 50_000 },
+      { type: 'turn/end', turn: 1, reason: { kind: 'error', error: { message: 'seeded failure' } }, time: seedNow - 40_000 },
+    ]),
+    // Blocked on an approval -> waiting, the one state the reader must act on.
+    withLog('seed-wait', 'K:/w/Wait', [{ type: 'approval/asked', id: 'a1', toolName: 'Bash', time: seedNow - 20_000 }]),
+  ]
+  const seededStore = { list: () => liveNow.slice(), get: (id) => liveNow.find((session) => session.id === id) }
+  const seededRoutes = createRoutes(
+    { logger, get: () => undefined },
+    { diagnostics: false },
+    { execFile: fileRedirectExecFile, on: () => () => {}, now: () => seedNow, attentionSessions: seededStore },
+  )
+  const seededBody = await (await seededRoutes.handleAttention(new Request(`http://localhost${ROUTES.attention}`))).json()
+  check('a mount with existing sessions reports them all', seededBody.sessions.length, 4)
+  check('and their states are recovered from the log, not assumed idle', seededBody.counts, {
+    waiting: 1,
+    error: 1,
+    done: 1,
+    running: 1,
+    idle: 0,
+  })
+  check(
+    'the running session survives the remount',
+    seededBody.sessions.filter((session) => session.state === 'running').map((session) => session.workspace),
+    ['Run'],
+  )
+  check(
+    'the failed session keeps its reason',
+    seededBody.sessions.find((session) => session.state === 'error')?.detail,
+    'seeded failure',
+  )
+  check(
+    'the finished session keeps the log timestamp, not the mount time',
+    seededBody.sessions.find((session) => session.workspace === 'Done')?.at,
+    seedNow - 60_000,
+  )
+  check(
+    'the blocked session still needs a human',
+    seededBody.sessions.find((session) => session.workspace === 'Wait')?.reason,
+    'approval',
+  )
+}
 
 // 9c. a broken subsystem still answers ok:true.
 const brokenAttentionRoutes = createRoutes(

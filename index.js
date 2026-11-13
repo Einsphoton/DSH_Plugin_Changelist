@@ -409,15 +409,31 @@ export function createRoutes(ctx, config = {}, deps = {}) {
   // and a deployment without them must still answer the route with an empty
   // list rather than fail. `deps.on` is the test seam (a fake `ctx.on`).
   const subscribe = typeof deps.on === 'function' ? deps.on : typeof ctx.on === 'function' ? ctx.on.bind(ctx) : null
+  // `deps.attentionSessions` is the second test seam: the real service is
+  // resolved lazily through `ctx.get`, but a suite needs to hand in a store
+  // whose sessions already have event logs, to prove seeding works — and an
+  // explicitly empty store, to describe a genuinely quiet Host.
+  const sessionsSource = () =>
+    Object.hasOwn(deps, 'attentionSessions') ? deps.attentionSessions : ctx.get?.('sessions')
   const sessionLookup = {
     get(id) {
       // Duck-typed on purpose: only `get(id)` is ever used, and a missing or
       // throwing service degrades this source instead of the route.
       try {
-        const service = ctx.get?.('sessions')
+        const service = sessionsSource()
         return typeof service?.get === 'function' ? service.get(id) : undefined
       } catch {
         return undefined
+      }
+    },
+    list() {
+      // The store is the authority on which sessions exist: without this the
+      // registry only describes sessions that emitted an event after mounting.
+      try {
+        const service = sessionsSource()
+        return typeof service?.list === 'function' ? service.list() : []
+      } catch {
+        return []
       }
     },
   }
