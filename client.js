@@ -152,6 +152,8 @@ window.__ModuleLoader__.load({
       attentionUnknownBody:
         '读不到会话状态，所以这里既不能说「全部正常」，也不能说「有事」。\n最常见的原因是运行中的 Host 半边还是旧版：本 profile 的 HMR 不监听源码，改完插件要在 Plugins 页面把该 bundle 关掉再打开（或重启 DSH），新的 /api/changelist.attention 路由才会注册。',
       attentionOpen: '打开',
+      attentionNotInList: '不在列表',
+      attentionNotOpenableHint: '这个会话不在当前窗口的会话列表里（{id}），无法直接打开。它可能已归档，或只属于另一个窗口。',
       attentionOpenFailed: '打不开这个会话（{id}）：它不在当前窗口的会话列表里，刷新后仍找不到',
       attentionOpenFailedShort: '打不开',
       attentionMarkAllRead: '全部标记已读',
@@ -293,6 +295,8 @@ window.__ModuleLoader__.load({
       attentionUnknownBody:
         'Session status cannot be read, so this cannot honestly say "all clear" or "something needs you".\nThe usual cause is a running Host half from before this feature: HMR does not watch sources in this profile, so toggle the bundle off and on in the Plugins page (or restart DSH) to register the new /api/changelist.attention route.',
       attentionOpen: 'Open',
+      attentionNotInList: 'not listed',
+      attentionNotOpenableHint: 'This session is not in this window’s session list ({id}), so it cannot be opened directly. It may be archived, or belong to another window.',
       attentionOpenFailed: 'Cannot open that session ({id}): it is not in this window’s session list, even after a refresh',
       attentionOpenFailedShort: 'Cannot open',
       attentionMarkAllRead: 'Mark all read',
@@ -1211,6 +1215,29 @@ window.__ModuleLoader__.load({
      * The session the user is looking at, derived the way the shipped sidebar
      * does it: the session retained by the main view.
      */
+    /**
+     * The session ids this window can actually select.
+     *
+     * `ctx.sessions.open(id)` selects through the CLIENT list, whose membership
+     * comes from the Host's persisted-session index. The attention route reports
+     * the HOST's live sessions instead, and the two are not the same set: a
+     * session running in this Host but absent from this window's index (finished
+     * and archived, or owned by another window's selection) appears in the guide
+     * yet can never be opened here. Knowing which is which up front is what lets
+     * the panel offer an honest action instead of a button that always fails.
+     */
+    function selectableSessionIds(service) {
+      try {
+        const snapshot = service?.list?.getSnapshot?.()
+        const ids = new Set()
+        for (const id of snapshot?.ids ?? []) ids.add(id)
+        for (const id of Object.keys(snapshot?.byId ?? {})) ids.add(id)
+        return ids
+      } catch {
+        return null
+      }
+    }
+
     function viewedSessionId(service) {
       try {
         const snapshot = service?.list?.getSnapshot?.()
@@ -1724,8 +1751,7 @@ window.__ModuleLoader__.load({
         succeed()
         return
       }
-      // The list this window holds is stale or simply never had this session:
-      // pull the Host's list, then retry once.
+      // Try once to widen the list, because a stale snapshot is the common case.
       try {
         if (typeof service?.refresh === 'function') await service.refresh()
       } catch {
@@ -1735,10 +1761,14 @@ window.__ModuleLoader__.load({
         succeed()
         return
       }
-      // Not openable here. Never pretend the click worked: mark the row and say
-      // it inline. `flashNotice` belongs to the changelist store, whose surfaces
-      // are not necessarily on screen — the guide has to report its own failure.
-      attention.set({ failed: sessionId, failedMessage: tr('attentionOpenFailed', { id: sessionId }) })
+      // Still unselectable. Keep the panel OPEN so the reader can see why: closing
+      // it on failure would hide the only explanation of what went wrong.
+      attention.set({
+        failed: sessionId,
+        failedMessage: selectableSessionIds(service)?.has(sessionId)
+          ? tr('attentionOpenFailed', { id: sessionId })
+          : tr('attentionNotOpenableHint', { id: sessionId }),
+      })
       if (typeof setTimeout === 'function') {
         setTimeout(() => {
           if (attention.get().failed === sessionId) attention.set({ failed: null, failedMessage: null })
@@ -2460,6 +2490,10 @@ window.__ModuleLoader__.load({
         if (rank !== 0) return rank
         return (right.at ?? 0) - (left.at ?? 0)
       })
+      // Which rows this window can actually select. `null` means "cannot tell"
+      // (the list snapshot has not arrived); those stay clickable because
+      // openSession refreshes the list before giving up.
+      const selectable = selectableSessionIds(sessionsService)
       const groups = attentionGroups(ordered)
       const permission = snapshot.permission
       const canAsk = permission === 'default' && !notificationAsked()
@@ -2508,22 +2542,32 @@ window.__ModuleLoader__.load({
                     h('span', { className: 'dshAt_groupName', title: group.name }, group.name || t('attentionUnknownWorkspace')),
                     h('span', { className: 'dshAt_groupCount' }, String(group.sessions.length)),
                   ),
-                  group.sessions.map((session) =>
-                    h(
+                  group.sessions.map((session) => {
+                    const openable = selectable === null || selectable.has(session.sessionId)
+                    return h(
                       'button',
                       {
                         type: 'button',
                         key: session.sessionId,
                         className: `dshAt_row${read[session.sessionId] ? ' dshAt_rowRead' : ''}`,
                         'data-failed': snapshot.failed === session.sessionId ? 'true' : undefined,
-                        title: `${session.title ?? ''}${session.dir ? `\n${session.dir}` : ''}`,
+                        'data-openable': openable ? 'true' : 'false',
+                        title: openable
+                          ? `${session.title ?? ''}${session.dir ? `\n${session.dir}` : ''}`
+                          : t('attentionNotOpenableHint', { id: session.sessionId }),
                         onClick: () => void openSession(session.sessionId, t),
                       },
                       h('span', { className: 'dshAt_stateIcon', 'data-state': session.state, 'aria-hidden': 'true' }, ATTENTION_ICON[session.state] ?? '·'),
                       h(
                         'span',
                         { className: 'dshAt_rowMain' },
-                        h('span', { className: 'dshAt_rowTitle' }, session.title || session.sessionId),
+                        // The group header already names the workspace. When the
+                        // session has no real title the Host falls back to the
+                        // directory basename, which repeats the header verbatim;
+                        // show the reason line alone rather than saying it twice.
+                        (session.title || session.sessionId) === group.name
+                          ? null
+                          : h('span', { className: 'dshAt_rowTitle' }, session.title || session.sessionId),
                         h(
                           'span',
                           { className: 'dshAt_rowMeta' },
@@ -2532,9 +2576,17 @@ window.__ModuleLoader__.load({
                           h('span', null, attentionAgo(session.at, t)),
                         ),
                       ),
-                      h('span', { className: 'dshAt_openHint' }, snapshot.failed === session.sessionId ? t('attentionOpenFailedShort') : t('attentionOpen')),
-                    ),
-                  ),
+                      h(
+                        'span',
+                        { className: 'dshAt_openHint' },
+                        snapshot.failed === session.sessionId
+                          ? t('attentionOpenFailedShort')
+                          : openable
+                            ? t('attentionOpen')
+                            : t('attentionNotInList'),
+                      ),
+                    )
+                  }),
                 ),
               ),
         ),

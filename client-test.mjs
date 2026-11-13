@@ -1649,6 +1649,15 @@ globalThis.Notification = FakeNotification
 
 const attentionSessions = []
 const attentionRegistered = []
+// Session ids this window's list can select. The guide hides "打开" for rows that
+// are absent here (see 16j); the shared helper advertises every id the fixtures
+// below report, so the ordinary rows stay openable.
+let selectableIds = null
+const listSnapshot = () => {
+  const byId = {}
+  for (const id of selectableIds ?? []) byId[id] = { id }
+  return { ids: [...(selectableIds ?? [])], byId }
+}
 function attentionApply(target) {
   const mod = captured.factory((name) => {
     if (name === 'react') return React
@@ -1660,9 +1669,12 @@ function attentionApply(target) {
     },
     sessions: {
       open(id) {
+        if (selectableIds !== null && !selectableIds.includes(id)) {
+          throw new Error(`sessions.select: unknown session ${id}`)
+        }
         attentionSessions.push(id)
       },
-      list: { getSnapshot: () => ({ byId: {} }) },
+      list: { getSnapshot: listSnapshot },
     },
     locale: ctx.locale,
     slots: {
@@ -1701,6 +1713,9 @@ checkThat('the pill exposes the counts to assistive tech', String(byClass(pillTr
 checkThat('a collapsed sidebar still renders a pill', byClass(expand(React.createElement(pillEntry.component, { t, wide: false })), 'dshAt_pill').length === 1)
 
 console.log('16b. the guide panel groups by workspace and opens a session')
+// Every session this fixture reports is also selectable in this window, so the
+// rows offer a working "打开".
+selectableIds = ['sess-wait', 'sess-done', 'sess-run']
 const pillButton = byClass(pillTree, 'dshAt_pill')[0]
 pillButton.props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 240, bottom: 800, height: 28 }) } })
 const panelTree = expand(React.createElement(panelEntry.component, { t }))
@@ -1808,7 +1823,9 @@ console.log('16b2. Open follows the real open() contract')
         throw new Error('nope')
       },
       async refresh() {},
-      list: { getSnapshot: () => ({ byId: {} }) },
+      // The row IS in this window's list (so the panel offers "打开"), but the
+      // service refuses to select it. That is the failure path worth testing.
+      list: { getSnapshot: () => ({ ids: ['sess-dead'], byId: { 'sess-dead': { id: 'sess-dead' } } }) },
     },
     locale: ctx.locale,
     slots: {
@@ -1828,14 +1845,25 @@ console.log('16b2. Open follows the real open() contract')
   })
   const deadPanel = deadRegistered.find((entry) => entry.id === 'changelist.attention.panel')
   hookQueue.length = 0
-  byClass(expand(React.createElement(deadPanel.component, { t })), 'dshAt_row')[0].props.onClick()
+  // The row is known-unselectable up front (the list snapshot does not contain
+  // it), so it must advertise that BEFORE the click rather than offering a
+  // button that can only fail.
+  const deadFirst = expand(React.createElement(deadPanel.component, { t }))
+  check('a selectable row offers Open', byClass(deadFirst, 'dshAt_row')[0]?.props['data-openable'], 'true')
+  byClass(deadFirst, 'dshAt_row')[0].props.onClick()
   await settle()
-  check('an unopenable session is retried exactly twice', deadCalls.length, 2)
+  check('a refusing service is attempted twice (with one refresh)', deadCalls.length, 2)
+  // The store now carries the failure; seed the shim's useState with it so the
+  // next render reads the post-click snapshot (the shim has no re-render loop).
+  const deadSnapshot = deadMod.attentionInternals.store.get()
+  check('the failure is recorded with the real reason', [deadSnapshot.failed, typeof deadSnapshot.failedMessage], ['sess-dead', 'string'])
   hookQueue.length = 0
+  hookQueue.push(deadSnapshot)
   const deadTree = expand(React.createElement(deadPanel.component, { t }))
   check('the row marks the failed open', byClass(deadTree, 'dshAt_row')[0]?.props['data-failed'], 'true')
-  checkThat('and says it could not open', collectText(deadTree).includes('打不开'), collectText(deadTree).slice(0, 300))
   checkThat('and explains it in the panel itself, not a toast elsewhere', byClass(deadTree, 'dshAt_failBar').length === 1, collectClasses(deadTree))
+  const failText = collectText(byClass(deadTree, 'dshAt_failBar')[0])
+  checkThat('the explanation names the real reason', failText.includes('不在当前窗口的会话列表'), failText)
   // A successful open clears the failure mark.
   attentionPayload = null
 }
