@@ -1,13 +1,20 @@
 /**
  * Host half of the workspace-changelist plugin.
  *
- * It answers three read-only routes for the browser half, registered inside the
+ * It answers four read-only routes for the browser half, registered inside the
  * Connection fetch fence so they inherit browser authentication and the
  * Host/Origin policy:
  *
  *   GET /api/changelist.targets
  *   GET /api/changelist.state?dir=<abs>[&vcs=auto|git|p4][&base=<ref>][&fetch=1][&remote=origin]
  *   GET /api/changelist.diff?dir=<abs>&path=<repo-relative>[&vcs=auto|git|p4][&base=<ref>]
+ *   GET /api/changelist.attention
+ *
+ * The first three answer "what changed in this workspace". The fourth answers
+ * "is any session, in any workspace, waiting for me" and takes no parameters at
+ * all: its input is the Host's own `session/event` stream, folded by
+ * {@link ./lib/attention.js}. It spawns nothing and writes nothing — it is a
+ * cache over events the Host already produced.
  *
  * Every directory is validated against the directories the Harness itself knows
  * (registered workspaces and live session working directories) before any
@@ -45,6 +52,7 @@ import {
   readWorkspace as readP4Workspace,
 } from './lib/p4.js'
 import { createBackendRouter } from './lib/vcs.js'
+import { ATTENTION_SCHEMA_VERSION, createAttentionRegistry, emptyAttentionCounts } from './lib/attention.js'
 
 export const name = 'changelist'
 
@@ -55,6 +63,7 @@ export const ROUTES = {
   targets: '/api/changelist.targets',
   state: '/api/changelist.state',
   diff: '/api/changelist.diff',
+  attention: '/api/changelist.attention',
 }
 
 export const DEFAULTS = {
@@ -104,6 +113,18 @@ export const DEFAULTS = {
   p4Shelved: true,
   /** Extra directories the routes may inspect, beyond registered workspaces and sessions. */
   allowedPaths: [],
+  /**
+   * Publish `/api/changelist.attention`, the cross-session "who needs me" view.
+   * It is derived from the Host's own `session/event` stream: no subprocess, no
+   * file write, no version-control command. Off means the route still exists but
+   * answers `{ok: true, enabled: false}` with an empty list, so a browser half
+   * that polls unconditionally never sees an error.
+   */
+  attentionEnabled: true,
+  /** Maximum sessions one attention answer carries. */
+  attentionMaxSessions: 50,
+  /** Milliseconds a session keeps its state without new evidence (one day). */
+  attentionRetentionMs: 86_400_000,
   /**
    * Append a bounded activity log next to the plugin (mount, unload, one line
    * per route request). This deployment exposes no Host log and the browser
@@ -362,10 +383,13 @@ const json = (payload, status = 200) =>
   })
 
 /**
- * Build the three route handlers against one context and configuration.
+ * Build the four route handlers against one context and configuration.
  * @param {object} ctx - plugin context; only `get` is required for target discovery.
  * @param {object} [config] - plugin configuration merged over {@link DEFAULTS}.
- * @param {{ execFile?: Function }} [deps] - test seam; production uses `node:child_process`.
+ * @param {{ execFile?: Function, on?: Function, now?: () => number }} [deps]
+ *   Test seams: `execFile` replaces the process runner, `on` the event
+ *   subscriber, `now` the clock. Production uses `node:child_process` and the
+ *   plugin context's own services.
  */
 export function createRoutes(ctx, config = {}, deps = {}) {
   const settings = { ...DEFAULTS, ...(config ?? {}) }
@@ -378,6 +402,34 @@ export function createRoutes(ctx, config = {}, deps = {}) {
   const run = createRunner(settings, deps.execFile ?? null)
   const readFile = createFileReader()
   const diagnostics = createDiagnostics(settings)
+
+  // ── Cross-project attention ─────────────────────────────────────────────
+  // A cache over the Host's own session events. The subscriber and the session
+  // store are resolved here but read lazily: services mount after this plugin,
+  // and a deployment without them must still answer the route with an empty
+  // list rather than fail. `deps.on` is the test seam (a fake `ctx.on`).
+  const subscribe = typeof deps.on === 'function' ? deps.on : typeof ctx.on === 'function' ? ctx.on.bind(ctx) : null
+  const sessionLookup = {
+    get(id) {
+      // Duck-typed on purpose: only `get(id)` is ever used, and a missing or
+      // throwing service degrades this source instead of the route.
+      try {
+        const service = ctx.get?.('sessions')
+        return typeof service?.get === 'function' ? service.get(id) : undefined
+      } catch {
+        return undefined
+      }
+    },
+  }
+  const attention = createAttentionRegistry({
+    on: subscribe,
+    sessions: sessionLookup,
+    now: deps.now,
+    limits: {
+      maxSessions: settings.attentionMaxSessions,
+      retentionMs: settings.attentionRetentionMs,
+    },
+  })
 
   // ── Perforce plumbing ───────────────────────────────────────────────────
   // The executable is resolved once, lazily: a deployment with no Perforce
@@ -738,7 +790,51 @@ export function createRoutes(ctx, config = {}, deps = {}) {
     return json({ ...diff, vcs: 'git', base: resolved.base })
   }
 
-  return { settings, limits, run, readFile, diagnostics, router, p4Executable, handleTargets, handleState, handleDiff }
+  /**
+   * The cross-session attention answer. Deliberately parameterless: the input is
+   * the Host's own session store and event stream, never the request, so there
+   * is no `dir`/`sessionId` a caller could name to widen what it sees (unknown
+   * query parameters are ignored, never 400'd).
+   *
+   * It cannot fail. Attention is advisory: a missing session service, a broken
+   * listener, or a throwing clock yields the same empty, zero-counted shape, so
+   * a browser polling this route never has to distinguish "nothing to report"
+   * from "the route is unhappy".
+   */
+  async function handleAttention() {
+    if (settings.attentionEnabled === false) {
+      return json({ ok: true, enabled: false, schemaVersion: ATTENTION_SCHEMA_VERSION, generatedAt: Date.now(), sessions: [], counts: emptyAttentionCounts() })
+    }
+    let snapshot = { generatedAt: Date.now(), sessions: [], counts: emptyAttentionCounts() }
+    try {
+      const read = attention.snapshot()
+      if (read && Array.isArray(read.sessions)) snapshot = read
+    } catch {
+      /* an advisory read that fails is an empty read */
+    }
+    return json({
+      ok: true,
+      schemaVersion: ATTENTION_SCHEMA_VERSION,
+      generatedAt: typeof snapshot.generatedAt === 'number' ? snapshot.generatedAt : Date.now(),
+      sessions: snapshot.sessions,
+      counts: snapshot.counts ?? emptyAttentionCounts(),
+    })
+  }
+
+  return {
+    settings,
+    limits,
+    run,
+    readFile,
+    diagnostics,
+    router,
+    p4Executable,
+    attention,
+    handleTargets,
+    handleState,
+    handleDiff,
+    handleAttention,
+  }
 }
 
 /**
@@ -746,7 +842,8 @@ export function createRoutes(ctx, config = {}, deps = {}) {
  * into one effect so unloading the plugin (or replacing the service) removes it.
  * @param {object} ctx - plugin context.
  * @param {object} [config] - plugin configuration.
- * @param {{ execFile?: Function }} [deps] - test seam; production uses `node:child_process`.
+ * @param {{ execFile?: Function, on?: Function, now?: () => number }} [deps]
+ *   Test seams; production uses `node:child_process` and the plugin context.
  */
 export function apply(ctx, config = {}, deps = {}) {
   const routes = createRoutes(ctx, config, deps)
@@ -868,6 +965,15 @@ export function apply(ctx, config = {}, deps = {}) {
       requestBody: 'buffered',
       fetch: guard('diff', routes.handleDiff),
     })
+    yield ctx.connection.fetch.register({
+      path: ROUTES.attention,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: guard('attention', routes.handleAttention),
+    })
+    // The attention registry owns a `session/event` subscription; the effect must
+    // own its disposer too, or a plugin unload would leave the listener behind.
+    yield routes.attention.dispose
     ctx.logger?.info?.('changelist: registered %s', Object.values(ROUTES).join(', '))
   }, 'changelist: fetch routes')
 }

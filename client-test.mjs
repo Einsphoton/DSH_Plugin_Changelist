@@ -177,6 +177,19 @@ const fetchStub = async (url) => {
       },
     }
   }
+  // The attention route reports every session across every workspace. `null`
+  // (the default) keeps the original payloads in charge, so every assertion
+  // above sees exactly what it saw before.
+  if (attentionPayload !== null && String(url).includes('.attention')) {
+    const body = attentionPayload
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return body
+      },
+    }
+  }
   // Optional: a p4-shaped `.state` answer for the Perforce UI coverage that
   // follows. `null` (the default) keeps the original git payload in charge, so
   // every assertion above sees exactly what it saw before.
@@ -207,6 +220,9 @@ const fetchStub = async (url) => {
 let rejectSessionId = false
 let stateFails = false
 let p4StatePayload = null
+// The cross-project attention answer, driven only by the section that covers
+// it; `null` everywhere else keeps the older sections untouched.
+let attentionPayload = null
 // Per-test overrides for the sections that need the list (or one comparison) to
 // change between reads. The default payloads above stay in charge of everything
 // before them.
@@ -307,17 +323,30 @@ const ctx = {
 }
 mod.apply(ctx)
 
-check('two surfaces registered', registered.map((entry) => entry.name), ['conversation.session.header.utilities', 'shell.overlay'])
+check('four surfaces registered', registered.map((entry) => entry.name), [
+  'conversation.session.header.utilities',
+  'shell.overlay',
+  'sidebar.footer.action',
+  'shell.overlay',
+])
 check('chip entry id', registered[0]?.id, 'changelist.chip')
 check('popover entry id', registered[1]?.id, 'changelist.popover')
-check('both await their owning declaration', owners, ['conversation.session.header.utilities', 'shell.overlay'])
+check('attention pill entry id', registered[2]?.id, 'changelist.attention.pill')
+check('attention panel entry id', registered[3]?.id, 'changelist.attention.panel')
+check('every surface awaits its owning declaration', owners, [
+  'conversation.session.header.utilities',
+  'shell.overlay',
+  'sidebar.footer.action',
+  'shell.overlay',
+])
 const chipFace = typeof registered[0]?.inject === 'function' ? registered[0].inject() : {}
 checkThat('the chip registration carries the viewed-session getter', typeof chipFace.getViewedSessionId === 'function', JSON.stringify(Object.keys(chipFace)))
 check('it derives the session the main view retains', chipFace.getViewedSessionId?.(), 'sess-1')
 check('locale namespace', dictionaries[0]?.namespace, 'dsh-changelist')
 checkThat('chinese dictionary present', typeof dictionaries[0]?.dict.zh.panel === 'string')
 checkThat('english dictionary present', typeof dictionaries[0]?.dict.en.panel === 'string')
-check('effects registered', effects.length, 2)
+// One style effect plus the two attention lifecycle effects.
+check('effects registered', effects.length, 3)
 checkThat('a style tag was injected', styleTags.length === 1, String(styleTags.length))
 checkThat('styles are plugin-prefixed', String(styleTags[0]?.textContent ?? '').includes('.dshCl_chip'), 'unprefixed css')
 checkThat('a floating surface is positioned, not in flow', String(styleTags[0]?.textContent ?? '').includes('.dshCl_pop{position:absolute'), 'no absolute popover')
@@ -491,9 +520,20 @@ mod.apply({
     },
   },
 })
-check('both surfaces still register', degradedRegistered, ['conversation.session.header.utilities', 'shell.overlay'])
-check('the same declarations were awaited', degradedOwners, ['conversation.session.header.utilities', 'shell.overlay'])
-check('only the style effect remains', degradedEffects.length, 1)
+check('every surface still registers', degradedRegistered, [
+  'conversation.session.header.utilities',
+  'shell.overlay',
+  'sidebar.footer.action',
+  'shell.overlay',
+])
+check('the same declarations were awaited', degradedOwners, [
+  'conversation.session.header.utilities',
+  'shell.overlay',
+  'sidebar.footer.action',
+  'shell.overlay',
+])
+// The style effect plus the attention lifecycle effect survive a locale-less host.
+check('only the style and attention effects remain', degradedEffects.length, 2)
 
 const degradedTree = expand(React.createElement(Chip, { sessionId: SESSION_ID }))
 checkThat('the chip renders without a translator', typeof degradedTree === 'object' && degradedTree !== null)
@@ -596,7 +636,9 @@ const lateCtx = {
   slots: ctx.slots,
 }
 mod.apply(lateCtx)
-const lateChip = registered.at(-2)
+// Look up by id, not by offset: the plugin registers more than two surfaces and
+// the chip must stay findable however many are added beside it.
+const lateChip = registered.filter((entry) => entry.id === 'changelist.chip').at(-1)
 const lateFace = lateChip.inject()
 checkThat('the registration exposes a session watcher', typeof lateFace.subscribeViewedSession === 'function', JSON.stringify(Object.keys(lateFace)))
 expand(React.createElement(lateChip.component, { t, getViewedSessionId: lateFace.getViewedSessionId, subscribeViewedSession: lateFace.subscribeViewedSession }))
@@ -1559,6 +1601,291 @@ checkThat(
   ['.dshCl_groups{', '.dshCl_panel{', '.dshCl_vcs{', '.dshCl_groupFiles{'].every((rule) => pluginCss.includes(rule)),
   'a styling rule is missing',
 )
+
+
+console.log('16. cross-project attention: the pill summarises every session')
+// Section 16 drives the two attention surfaces with a Host answer reporting
+// sessions in OTHER workspaces - the case the changelist surfaces cannot see.
+// The stub feeds this through fetchStub (the module closes over that binding),
+// so no global is swapped behind the plugin's back.
+attentionPayload = {
+  ok: true,
+  schemaVersion: 1,
+  generatedAt: Date.now(),
+  sessions: [
+    { sessionId: 'sess-wait', title: 'waiting-session', dir: 'C:/work/Alpha', workspace: 'Alpha', state: 'waiting', reason: 'approval', turn: 3, since: Date.now() - 60000, at: Date.now() - 30000, running: true },
+    { sessionId: 'sess-done', title: 'finished-session', dir: 'C:/work/Beta', workspace: 'Beta', state: 'done', reason: 'turn-end', turn: 5, since: Date.now() - 120000, at: Date.now() - 90000, running: false },
+    { sessionId: 'sess-run', title: 'running-session', dir: 'C:/work/Beta', workspace: 'Beta', state: 'running', reason: 'activity', turn: 1, since: Date.now() - 5000, at: Date.now() - 1000, running: true },
+  ],
+  counts: { waiting: 1, error: 0, done: 1, running: 1, idle: 0 },
+}
+
+// A Notification double: nothing below needs the real platform API. It is
+// installed on the window the module was evaluated against, which is the same
+// object the plugin reads through its `window` parameter.
+const sentNotifications = []
+const notificationState = { permission: 'granted' }
+function FakeNotification(title, options) {
+  sentNotifications.push({ title, options })
+  this.close = () => {}
+}
+FakeNotification.permission = 'granted'
+FakeNotification.requestPermission = async () => notificationState.permission
+window.Notification = FakeNotification
+window.focus = () => {}
+globalThis.Notification = FakeNotification
+
+const attentionSessions = []
+const attentionRegistered = []
+function attentionApply(target) {
+  const mod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  mod.apply({
+    effect(fn) {
+      void fn()
+    },
+    sessions: {
+      open(id) {
+        attentionSessions.push(id)
+      },
+      list: { getSnapshot: () => ({ byId: {} }) },
+    },
+    locale: ctx.locale,
+    slots: {
+      inject(owner, register) {
+        void register()
+      },
+      register(options, component) {
+        target.push({ ...options, component })
+        return () => {}
+      },
+    },
+  })
+  return target
+}
+attentionApply(attentionRegistered)
+const pillEntry = attentionRegistered.find((entry) => entry.id === 'changelist.attention.pill')
+const panelEntry = attentionRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+checkThat('the pill registers into the sidebar foot', pillEntry?.name === 'sidebar.footer.action', JSON.stringify(attentionRegistered.map((e) => e.name)))
+checkThat('the guide panel registers into the overlay layer', panelEntry?.name === 'shell.overlay', JSON.stringify(attentionRegistered.map((e) => e.name)))
+checkThat('the pill never replaces the workspace browser', attentionRegistered.every((entry) => entry.name !== 'sidebar.workspaces'), 'registered over ui-workspace')
+
+const attentionRoutesBefore = requests.length
+hookQueue.length = 0
+let pillTree = expand(React.createElement(pillEntry.component, { t, wide: true }))
+await settle()
+hookQueue.length = 0
+pillTree = expand(React.createElement(pillEntry.component, { t, wide: true }))
+const attentionRequests = requests.slice(attentionRoutesBefore)
+checkThat('the pill polls the attention route', attentionRequests.some((url) => url.includes('changelist.attention')), attentionRequests.join(' | '))
+checkThat('the attention route stays document-relative', attentionRequests.every((url) => !String(url).startsWith('/')), attentionRequests.join(' | '))
+checkThat('the pill counts the sessions waiting for a human', collectText(pillTree).includes('1'), collectText(pillTree))
+check('the pill is coloured by the worst state', byClass(pillTree, 'dshAt_pill')[0]?.props['data-state'], 'waiting')
+checkThat('the call-out points at the workspace list', collectText(pillTree).length > 0, collectText(pillTree))
+check('the pill marks itself as a dialog opener', byClass(pillTree, 'dshAt_pill')[0]?.props['aria-haspopup'], 'dialog')
+checkThat('the pill exposes the counts to assistive tech', String(byClass(pillTree, 'dshAt_pill')[0]?.props['aria-label'] ?? '').length > 0, String(byClass(pillTree, 'dshAt_pill')[0]?.props['aria-label']))
+checkThat('a collapsed sidebar still renders a pill', byClass(expand(React.createElement(pillEntry.component, { t, wide: false })), 'dshAt_pill').length === 1)
+
+console.log('16b. the guide panel groups by workspace and opens a session')
+const pillButton = byClass(pillTree, 'dshAt_pill')[0]
+pillButton.props.onClick({ currentTarget: { getBoundingClientRect: () => ({ right: 240, bottom: 800, height: 28 }) } })
+const panelTree = expand(React.createElement(panelEntry.component, { t }))
+checkThat('the panel opens on a click', collectClasses(panelTree).includes('dshAt_pop'), collectClasses(panelTree))
+const groupHeads = byClass(panelTree, 'dshAt_groupName').map((node) => collectText(node))
+check('the panel groups by workspace, not by path', groupHeads, ['Alpha', 'Beta'])
+check('every reported session has a row', byClass(panelTree, 'dshAt_row').length, 3)
+check('the waiting row sorts first', byClass(panelTree, 'dshAt_row')[0]?.props.title?.split('\n')[0], 'waiting-session')
+const rowsText = byClass(panelTree, 'dshAt_row').map((node) => collectText(node)).join(' | ')
+checkThat('the reason is spelled out per row', rowsText.includes('waiting-session') && rowsText.includes('finished-session'), rowsText)
+byClass(panelTree, 'dshAt_row')[0].props.onClick()
+check('opening a row opens that session', attentionSessions, ['sess-wait'])
+// `waiting` is sticky: opening the row must not silence a still-blocked agent.
+const reopened = expand(React.createElement(panelEntry.component, { t }))
+check('a waiting row stays loud after being opened', byClass(reopened, 'dshAt_row')[0]?.props.className, 'dshAt_row')
+
+console.log('16c. OS notifications respect permission and quiet hours')
+// The mount read is deliberately silent (a page reload must never re-notify for
+// old news), so a transition is produced the way production produces one: a
+// second poll whose answer differs from the first. The batch window is shrunk
+// through the plugin's own test seam instead of sleeping two real seconds.
+const internals = mod.attentionInternals
+checkThat('the plugin exposes its attention test seam', typeof internals?.tuning === 'object' && typeof internals?.load === 'function')
+internals.tuning.notifyBatchMs = 5
+sentNotifications.length = 0
+attentionPayload = {
+  ok: true,
+  schemaVersion: 1,
+  generatedAt: Date.now(),
+  sessions: [
+    { sessionId: 'sess-wait', title: 'waiting-session', dir: 'C:/work/Alpha', workspace: 'Alpha', state: 'waiting', reason: 'approval', turn: 3, since: Date.now() - 60000, at: Date.now() - 30000, running: true },
+  ],
+  counts: { waiting: 1, error: 0, done: 0, running: 0, idle: 0 },
+}
+// A `running` -> `waiting` transition for another workspace, polled while the
+// reader looks at a different session.
+await internals.load({ t })
+await new Promise((resolve) => setTimeout(resolve, 60))
+checkThat('a waiting transition in another session notifies', sentNotifications.length > 0, String(sentNotifications.length))
+checkThat('the notification names the workspace', sentNotifications.some((entry) => String(entry.title).includes('Alpha')), JSON.stringify(sentNotifications.map((n) => n.title)))
+checkThat('the notification carries a dedupe tag', sentNotifications.every((entry) => typeof entry.options?.tag === 'string'), JSON.stringify(sentNotifications.map((n) => n.options)))
+
+// Permission denied: nothing is sent, but the surfaces still paint.
+notificationState.permission = 'denied'
+FakeNotification.permission = 'denied'
+const deniedRegistered = attentionApply([])
+const deniedPill = deniedRegistered.find((entry) => entry.id === 'changelist.attention.pill')
+const deniedPanel = deniedRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+sentNotifications.length = 0
+hookQueue.length = 0
+expand(React.createElement(deniedPill.component, { t, wide: true }))
+await new Promise((resolve) => setTimeout(resolve, 60))
+check('a denied permission sends nothing', sentNotifications.length, 0)
+byClass(expand(React.createElement(deniedPill.component, { t, wide: true })), 'dshAt_pill')[0]?.props?.onClick?.({ currentTarget: { getBoundingClientRect: () => ({ right: 240, bottom: 800, height: 28 }) } })
+const deniedPanelTree = expand(React.createElement(deniedPanel.component, { t }))
+checkThat('the panel still lists sessions without permission', byClass(deniedPanelTree, 'dshAt_row').length === 1, collectText(deniedPanelTree).slice(0, 200))
+FakeNotification.permission = 'granted'
+notificationState.permission = 'granted'
+
+console.log('16d. the state model only escalates on a real transition')
+// An unchanged `waiting` state is the same fact twice: it must not re-notify.
+sentNotifications.length = 0
+await internals.load({ t })
+await internals.load({ t })
+await new Promise((resolve) => setTimeout(resolve, 60))
+check('a repeated identical state does not re-notify', sentNotifications.length, 0)
+// A `running` session never notifies, however long it runs.
+attentionPayload = {
+  ok: true,
+  schemaVersion: 1,
+  generatedAt: Date.now(),
+  sessions: [
+    { sessionId: 'sess-run', title: 'running-session', dir: 'C:/work/Beta', workspace: 'Beta', state: 'running', reason: 'activity', turn: 1, since: Date.now(), at: Date.now(), running: true },
+  ],
+  counts: { waiting: 0, error: 0, done: 0, running: 1, idle: 0 },
+}
+sentNotifications.length = 0
+await internals.load({ t })
+await new Promise((resolve) => setTimeout(resolve, 60))
+check('a running session is never announced', sentNotifications.length, 0)
+
+console.log('16e. the document title and badge mirror the unread count')
+attentionPayload = {
+  ok: true,
+  schemaVersion: 1,
+  generatedAt: Date.now(),
+  sessions: [
+    { sessionId: 'sess-wait', title: 'waiting-session', dir: 'C:/work/Alpha', workspace: 'Alpha', state: 'waiting', reason: 'approval', turn: 3, since: Date.now(), at: Date.now(), running: true },
+  ],
+  counts: { waiting: 1, error: 0, done: 0, running: 0, idle: 0 },
+}
+await internals.load({ t, silent: true })
+check('one unread session prefixes the title', document.title.startsWith('(1) '), true)
+const summaryNow = internals.summary(internals.store.get())
+check('the summary counts the waiting session', summaryNow.counts.waiting, 1)
+check('and names the worst state', summaryNow.worst, 'waiting')
+attentionPayload = { ok: true, schemaVersion: 1, generatedAt: Date.now(), sessions: [], counts: { waiting: 0, error: 0, done: 0, running: 0, idle: 0 } }
+await internals.load({ t, silent: true })
+check('an all-clear answer drops the prefix again', document.title.startsWith('(1) '), false)
+
+console.log('16f. attentionEnabled:false leaves no trace')
+// The Host answers the disabled branch with `enabled:false` and an empty list.
+// That must claim no sidebar space and no title prefix, not render a "0" pill.
+// These surfaces must come from the SAME module instance whose store `internals`
+// drives: a factory call mints a fresh store, so mixing them would test nothing.
+const ownRegistered = []
+mod.apply({
+  effect(fn) {
+    void fn()
+  },
+  sessions: { open() {}, list: { getSnapshot: () => ({ byId: {} }) } },
+  locale: ctx.locale,
+  slots: {
+    inject(owner, register) {
+      void register()
+    },
+    register(options, component) {
+      ownRegistered.push({ ...options, component })
+      return () => {}
+    },
+  },
+})
+const ownPill = ownRegistered.find((entry) => entry.id === 'changelist.attention.pill')
+const ownPanel = ownRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+attentionPayload = { ok: true, enabled: false, schemaVersion: 1, generatedAt: Date.now(), sessions: [], counts: { waiting: 0, error: 0, done: 0, running: 0, idle: 0 } }
+await internals.load({ t, silent: true })
+hookQueue.length = 0
+checkThat('a disabled Host renders no pill', expand(React.createElement(ownPill.component, { t, wide: true })) === null, 'pill still rendered')
+check('and clears the title prefix', document.title.startsWith('('), false)
+check('and reports itself disabled', internals.store.get().enabled, false)
+// Re-enabling restores the surfaces.
+attentionPayload = { ok: true, schemaVersion: 1, generatedAt: Date.now(), sessions: [], counts: { waiting: 0, error: 0, done: 0, running: 0, idle: 0 } }
+await internals.load({ t, silent: true })
+hookQueue.length = 0
+// One settled mount: the seeded snapshot is read before the effect re-registers,
+// so a second render is what a reader actually sees.
+expand(React.createElement(ownPill.component, { t, wide: true }))
+await settle()
+hookQueue.length = 0
+checkThat('an enabled Host renders the pill again', byClass(expand(React.createElement(ownPill.component, { t, wide: true })), 'dshAt_pill').length === 1, 'pill missing')
+
+console.log('16g. the wire shape the Host actually sends')
+// Pinned against a real answer captured from the Host handler, so a rename on
+// either half fails here instead of in the UI. Backslash `dir` is deliberate:
+// that is what a Windows session cwd looks like coming off the wire.
+const WIRE_SESSION = {
+  sessionId: 'sess-abc',
+  title: 'Alpha',
+  dir: 'C:\\work\\Alpha',
+  workspace: 'Alpha',
+  state: 'error',
+  reason: 'turn-error',
+  turn: 4,
+  since: 1794536038652,
+  at: 1794536038652,
+  running: false,
+  detail: 'connect ECONNREFUSED 127.0.0.1:443',
+}
+attentionPayload = { ok: true, schemaVersion: 1, generatedAt: 1794536040000, sessions: [WIRE_SESSION], counts: { waiting: 0, error: 1, done: 0, running: 0, idle: 0 } }
+// A mounted pill owns a polling effect whose in-flight read would otherwise
+// answer from the PREVIOUS payload (loadAttention shares one in-flight promise).
+// Let that drain first, then read deliberately.
+await settle()
+await internals.load({ t, silent: true })
+const wireSnapshot = internals.store.get()
+check('the wire row lands unmodified', wireSnapshot.sessions[0], WIRE_SESSION)
+checkThat(
+  'every field the client reads is present on the wire',
+  ['sessionId', 'title', 'dir', 'workspace', 'state', 'reason', 'at'].every((key) => key in WIRE_SESSION),
+  JSON.stringify(Object.keys(WIRE_SESSION)),
+)
+check('the worst state is the error', internals.summary(wireSnapshot).worst, 'error')
+// A backslash `dir` must still group under the workspace name, not the raw path,
+// and the panel must render that row from THIS module instance's store.
+internals.store.set({ open: true, anchor: null })
+hookQueue.length = 0
+const wireTree = expand(React.createElement(ownPanel.component, { t }))
+check(
+  'grouping uses the workspace name, not the raw path',
+  byClass(wireTree, 'dshAt_groupName').map((node) => collectText(node)),
+  ['Alpha'],
+)
+check('the error row renders once', byClass(wireTree, 'dshAt_row').length, 1)
+internals.store.set({ open: false })
+
+console.log('17. the attention surfaces carry their own styling contract')
+checkThat('the pill has a rail (collapsed) variant', pluginCss.includes('.dshAt_pill[data-rail=true]'), 'no rail rule')
+checkThat('the pill carries a caret for "needs you"', pluginCss.includes('.dshAt_caret{'), 'no caret rule')
+checkThat('the panel is positioned, not in flow', pluginCss.includes('.dshAt_pop{position:absolute'), 'no absolute panel')
+checkThat(
+  'the four states map to the semantic colour tokens',
+  ['.dshAt_dot[data-state=waiting]', '.dshAt_dot[data-state=error]', '.dshAt_dot[data-state=done]', '.dshAt_dot[data-state=running]'].every((rule) =>
+    pluginCss.includes(rule),
+  ),
+  'a state colour is missing',
+)
+checkThat('the guide panel has its own row and group rules', pluginCss.includes('.dshAt_row{') && pluginCss.includes('.dshAt_groupHead{'), 'attention rules missing')
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

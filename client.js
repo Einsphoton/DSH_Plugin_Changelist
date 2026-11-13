@@ -24,6 +24,8 @@ window.__ModuleLoader__.load({
     const NS = 'dsh-changelist'
     const CHIP_ID = 'changelist.chip'
     const POPOVER_ID = 'changelist.popover'
+    const ATTENTION_PILL_ID = 'changelist.attention.pill'
+    const ATTENTION_PANEL_ID = 'changelist.attention.panel'
     // v2: the first version remembered a directory that could then outrank the
     // session the chip was rendered in, so that memory is deliberately dropped.
     const STORAGE_KEY = 'dsh-changelist.dir.v2'
@@ -129,6 +131,42 @@ window.__ModuleLoader__.load({
         '这些值只作为本次会话的查询参数发送（p4port / p4user / p4client / p4charset、localEdits=1），不写入任何配置文件；改完点「应用」重新读取。',
       applyOverrides: '应用',
       p4ReadOnly: '只读：不会 open/edit/submit，也不会写任何配置文件。',
+      // ── attention（跨项目状态提示） ─────────────────────────────────────
+      attentionPanel: '跨项目状态',
+      attentionPillClear: '全部正常',
+      attentionPillWaiting: '{count} 待处理',
+      attentionPillError: '{count} 出错',
+      attentionPillDone: '{count} 已完成',
+      attentionCalloutWaiting: '工作区里有 {count} 个会话在等你',
+      attentionCalloutError: '{count} 个会话本轮出错了',
+      attentionEnableNotifications: '打开系统通知',
+      attentionNotificationsOff: '系统通知未开启：改为在标题栏与侧栏提示',
+      attentionNotificationsBlocked: '系统通知被拒绝；可在系统设置 › 通知 里允许本应用',
+      attentionQuietLine: '只在别的会话需要你时提醒，正在看的会话不打扰',
+      attentionWatching: '监视全部会话 · 每 {seconds} 秒',
+      attentionEmpty: '所有会话都正常。别的会话完成的、出错的、或等你确认的，都会出现在这里。',
+      attentionOpen: '打开',
+      attentionMarkAllRead: '全部标记已读',
+      attentionUnknownWorkspace: '未知工作区',
+      attentionAgoJustNow: '刚刚',
+      attentionAgoMinutes: '{count} 分钟前',
+      attentionAgoHours: '{count} 小时前',
+      attentionAgoDays: '{count} 天前',
+      stateWaiting: '待处理',
+      stateError: '出错',
+      stateDone: '已完成',
+      stateRunning: '进行中',
+      stateIdle: '空闲',
+      reasonApproval: '等待确认',
+      reasonQuestion: '等待回答',
+      reasonBlocked: '等待恢复',
+      reasonTurnError: '本轮出错',
+      reasonTurnEnd: '本轮完成',
+      reasonUnknown: '状态变化',
+      notifyWaitingTitle: '「{workspace}」等你确认',
+      notifyErrorTitle: '「{workspace}」本轮出错',
+      notifyDoneTitle: '「{workspace}」已完成',
+      notifyBatchTitle: '{count} 个会话有更新',
     }
     const en = {
       panel: 'Workspace changes',
@@ -224,6 +262,42 @@ window.__ModuleLoader__.load({
         'These values are sent as this session’s query parameters only (p4port / p4user / p4client / p4charset, localEdits=1); no config file is written. Press Apply to re-read.',
       applyOverrides: 'Apply',
       p4ReadOnly: 'Read-only: no open/edit/submit, and no config file is written.',
+      // ── attention (cross-project status) ────────────────────────────────
+      attentionPanel: 'All sessions',
+      attentionPillClear: 'All clear',
+      attentionPillWaiting: '{count} need you',
+      attentionPillError: '{count} failed',
+      attentionPillDone: '{count} finished',
+      attentionCalloutWaiting: '{count} session(s) are waiting for you',
+      attentionCalloutError: '{count} session(s) ended with an error',
+      attentionEnableNotifications: 'Enable system notifications',
+      attentionNotificationsOff: 'System notifications are off: falling back to the title and sidebar',
+      attentionNotificationsBlocked: 'System notifications were denied; allow this app in System Settings › Notifications',
+      attentionQuietLine: 'Only speaks up for other sessions; the one you are reading stays quiet',
+      attentionWatching: 'Watching every session · every {seconds}s',
+      attentionEmpty: 'Every session is healthy. Completions, failures and pending questions from other sessions show up here.',
+      attentionOpen: 'Open',
+      attentionMarkAllRead: 'Mark all read',
+      attentionUnknownWorkspace: 'Unknown workspace',
+      attentionAgoJustNow: 'just now',
+      attentionAgoMinutes: '{count} min ago',
+      attentionAgoHours: '{count} h ago',
+      attentionAgoDays: '{count} d ago',
+      stateWaiting: 'Needs you',
+      stateError: 'Error',
+      stateDone: 'Finished',
+      stateRunning: 'Running',
+      stateIdle: 'Idle',
+      reasonApproval: 'Waiting for approval',
+      reasonQuestion: 'Waiting for an answer',
+      reasonBlocked: 'Blocked',
+      reasonTurnError: 'Turn failed',
+      reasonTurnEnd: 'Turn finished',
+      reasonUnknown: 'State changed',
+      notifyWaitingTitle: '“{workspace}” needs you',
+      notifyErrorTitle: '“{workspace}” hit an error',
+      notifyDoneTitle: '“{workspace}” finished',
+      notifyBatchTitle: '{count} sessions changed',
     }
 
     const css = [
@@ -319,6 +393,56 @@ window.__ModuleLoader__.load({
       '.dshCl_panelHint{color:var(--dsw-alias-label-tertiary);font-size:11px}',
       '.dshCl_check{display:inline-flex;align-items:center;gap:6px;color:var(--dsw-alias-label-secondary);font-size:11px;cursor:pointer}',
       '.dshCl_warn{color:var(--dsw-alias-state-warn-primary,#bf8700);font-size:11px;white-space:pre-wrap}',
+      /* ── attention: the sidebar-foot pill ─────────────────────────────── */
+      /* `position:relative` is what both the call-out and the guide panel
+         measure against, so the pointer aims at this row wherever it sits. */
+      '.dshAt_root{position:relative;display:flex;align-items:center;min-width:0}',
+      '.dshAt_pill{display:inline-flex;align-items:center;gap:6px;min-width:0;height:28px;max-width:100%;padding:0 9px;border:.5px solid var(--dsw-alias-border-l3);border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);font:inherit;font-size:12px;line-height:1;cursor:pointer;white-space:nowrap;overflow:hidden;transition:background 60ms linear,color 60ms linear}',
+      '.dshAt_pill:hover{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshAt_pill[aria-expanded=true]{background:var(--dsw-alias-interactive-bg-hover);color:var(--dsw-alias-label-primary)}',
+      '.dshAt_pill[data-rail=true]{width:28px;height:28px;padding:0;justify-content:center}',
+      '.dshAt_dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--dsw-alias-label-tertiary)}',
+      '.dshAt_dot[data-state=waiting]{background:var(--dsw-alias-state-warn-primary,#bf8700)}',
+      '.dshAt_dot[data-state=error]{background:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshAt_dot[data-state=done]{background:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshAt_dot[data-state=running]{background:var(--dsw-alias-state-business-primary,#4c6ef5)}',
+      '.dshAt_text{min-width:0;overflow:hidden;text-overflow:ellipsis;font-family:var(--ds-font-family-code)}',
+      '.dshAt_pill[data-state=waiting] .dshAt_text{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
+      '.dshAt_pill[data-state=error] .dshAt_text{color:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshAt_pill[data-state=done] .dshAt_text{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshAt_caret{flex:none;color:var(--dsw-alias-state-warn-primary,#bf8700);font-size:9px;line-height:1}',
+      '.dshAt_callout{flex:0 0 auto;max-width:190px;color:var(--dsw-alias-state-warn-primary,#bf8700);font-size:11px;line-height:1.35;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      /* ── attention: the guide panel (overlay layer) ───────────────────── */
+      '.dshAt_pop{position:absolute;z-index:22;display:flex;flex-direction:column;width:min(392px,92vw);max-height:min(70vh,560px);pointer-events:auto;border:.5px solid var(--dsw-alias-border-l2);border-radius:12px;background:var(--dsw-alias-bg-layer-1,var(--dsw-alias-bg-base));color:var(--dsw-alias-label-primary);box-shadow:0 12px 32px rgba(0,0,0,.18);overflow:hidden;font-size:13px}',
+      '.dshAt_head{flex:none;display:flex;align-items:center;gap:8px;padding:10px 12px;border-bottom:.5px solid var(--dsw-alias-border-l3)}',
+      '.dshAt_title{flex:none;margin:0;font-size:13px;font-weight:600}',
+      '.dshAt_headMeta{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-family:var(--ds-font-family-code);font-size:11px}',
+      '.dshAt_body{flex:1;min-height:0;overflow:auto;padding:6px}',
+      '.dshAt_group{display:flex;flex-direction:column;margin-bottom:8px}',
+      '.dshAt_group:last-child{margin-bottom:0}',
+      '.dshAt_groupHead{display:flex;align-items:center;gap:6px;padding:4px 8px;color:var(--dsw-alias-label-tertiary);font-size:11px;font-family:var(--ds-font-family-code)}',
+      '.dshAt_groupName{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dshAt_groupCount{flex:none}',
+      '.dshAt_row{display:flex;align-items:center;gap:8px;width:100%;padding:6px 8px;border:none;border-radius:7px;background:transparent;color:inherit;font:inherit;text-align:left;cursor:pointer}',
+      '.dshAt_row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dshAt_rowRead{opacity:.62}',
+      '.dshAt_stateIcon{flex:none;width:14px;text-align:center;font-size:11px;line-height:1}',
+      '.dshAt_stateIcon[data-state=waiting]{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
+      '.dshAt_stateIcon[data-state=error]{color:var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshAt_stateIcon[data-state=done]{color:var(--dsw-alias-state-success-primary,#2f9e44)}',
+      '.dshAt_stateIcon[data-state=running]{color:var(--dsw-alias-state-business-primary,#4c6ef5)}',
+      '.dshAt_rowMain{flex:1;min-width:0;display:flex;flex-direction:column;gap:1px}',
+      '.dshAt_rowTitle{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px}',
+      '.dshAt_rowMeta{min-width:0;display:flex;gap:6px;overflow:hidden;white-space:nowrap;color:var(--dsw-alias-label-tertiary);font-size:11px;font-family:var(--ds-font-family-code)}',
+      '.dshAt_rowReason{min-width:0;overflow:hidden;text-overflow:ellipsis}',
+      '.dshAt_rowDot{flex:none;color:var(--dsw-alias-label-tertiary)}',
+      '.dshAt_openHint{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px}',
+      '.dshAt_row:hover .dshAt_openHint{color:var(--dsw-alias-label-primary)}',
+      '.dshAt_empty{padding:20px 14px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.6;text-align:center}',
+      '.dshAt_foot{flex:none;display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-label-tertiary);font-size:11px}',
+      '.dshAt_footText{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.dshAt_legend{flex:none;display:flex;flex-wrap:wrap;gap:6px 12px;padding:0 12px 10px;color:var(--dsw-alias-label-tertiary);font-size:11px}',
+      '.dshAt_legendItem{display:inline-flex;align-items:center;gap:4px}',
     ].join('')
 
     const STATUS_CLASS = { M: 'dshCl_sM', A: 'dshCl_sA', D: 'dshCl_sD', R: 'dshCl_sR', C: 'dshCl_sR', T: 'dshCl_sM' }
@@ -1088,6 +1212,455 @@ window.__ModuleLoader__.load({
     /** The identity a picker option carries, so a synthetic target stays selectable. */
     const targetKey = (target) => (target.kind === 'session' ? `session:${target.id}` : `dir:${target.dir}`)
 
+    // ── attention: cross-project status, one store, three layers ──────────
+    //
+    // The changelist surfaces above answer "what changed in the project I am
+    // looking at". Nothing answered "is anything ELSE waiting for me" — with
+    // several sessions across several workspace folders, a finished turn, a
+    // failed turn, or a pending approval sitting in an unopened session was
+    // invisible until the reader happened to click into that session.
+    //
+    // Three layers, quietest first:
+    //   L3 sidebar pill + guide panel  — always on, no permission needed;
+    //   L2 document-title prefix/badge — always on, no permission needed;
+    //   L1 OS notification             — only with permission, only for a
+    //                                    session the reader is not looking at.
+    // Everything is derived from one read-only Host route, polled, because the
+    // browser gets no event feed for sessions it has not opened.
+
+    const ATTENTION_BASE = `${BASE}.attention`
+    /**
+     * Tunables, kept in one mutable object so the verification suite can drive
+     * the poll/notify clock without five-second sleeps. Production never writes
+     * to it; the defaults are the contract.
+     */
+    const attentionTuning = {
+      pollVisibleMs: 5000,
+      pollHiddenMs: 15000,
+      /** A `done` reminder stops being useful; `waiting` and `error` never expire. */
+      doneTtlMs: 10 * 60 * 1000,
+      /** Coalescing window for OS notifications: N transitions in one window = one toast. */
+      notifyBatchMs: 2000,
+    }
+    const ATTENTION_ASKED_KEY = 'dsh-changelist.attention.notifyAsked'
+    const ATTENTION_DENIED_KEY = 'dsh-changelist.attention.notifyDenied'
+    /** Worst first: what the pill summarises and how the panel sorts. */
+    const ATTENTION_STATE_ORDER = ['waiting', 'error', 'done', 'running', 'idle']
+    /** States that deserve a human's attention; `running`/`idle` never notify. */
+    const ATTENTION_LOUD = new Set(['waiting', 'error', 'done'])
+    const ATTENTION_ICON = { waiting: '!', error: '✕', done: '✓', running: '·', idle: '·' }
+    const ATTENTION_STATE_KEY = {
+      waiting: 'stateWaiting',
+      error: 'stateError',
+      done: 'stateDone',
+      running: 'stateRunning',
+      idle: 'stateIdle',
+    }
+    const ATTENTION_REASON_KEY = {
+      approval: 'reasonApproval',
+      question: 'reasonQuestion',
+      blocked: 'reasonBlocked',
+      'turn-error': 'reasonTurnError',
+      'turn-end': 'reasonTurnEnd',
+    }
+
+    // A third store: attention is independent of the changelist target and must
+    // keep working on the welcome screen (where no session header exists).
+    const attention = {
+      snapshot: {
+        open: false,
+        /** Anchor rect measured from the pill, so the panel points at it. */
+        anchor: null,
+        sessions: [],
+        counts: { waiting: 0, error: 0, done: 0, running: 0, idle: 0 },
+        /** Session ids the reader has acknowledged; `waiting` never clears. */
+        read: {},
+        phase: 'idle',
+        error: null,
+        generatedAt: null,
+        /** False when the Host reports `enabled:false`: the feature is switched off. */
+        enabled: true,
+        /** True once the reader has been shown the call-out for the current waiting set. */
+        calloutSeen: false,
+        waitingKey: '',
+        /** Permission state for L1: 'default' | 'granted' | 'denied' | 'unsupported'. */
+        permission: 'unsupported',
+      },
+      listeners: new Set(),
+      get() {
+        return attention.snapshot
+      },
+      set(patch) {
+        attention.snapshot = { ...attention.snapshot, ...patch }
+        for (const listener of [...attention.listeners]) listener()
+      },
+      subscribe(listener) {
+        attention.listeners.add(listener)
+        return () => attention.listeners.delete(listener)
+      },
+    }
+
+    function useAttention() {
+      const [snapshot, setSnapshot] = React.useState(attention.get())
+      React.useEffect(() => attention.subscribe(() => setSnapshot(attention.get())), [])
+      return snapshot
+    }
+
+    const hasNotifications = () => {
+      try {
+        return typeof window !== 'undefined' && typeof window.Notification === 'function'
+      } catch {
+        return false
+      }
+    }
+    const notificationPermission = () => {
+      try {
+        if (!hasNotifications()) return 'unsupported'
+        return window.Notification.permission ?? 'default'
+      } catch {
+        return 'unsupported'
+      }
+    }
+    /** Has the reader already been asked? Asking twice is the fastest way to get denied. */
+    function notificationAsked() {
+      try {
+        return window.localStorage.getItem(ATTENTION_ASKED_KEY) === '1'
+      } catch {
+        return false
+      }
+    }
+    function rememberNotificationAsked(denied) {
+      try {
+        window.localStorage.setItem(ATTENTION_ASKED_KEY, '1')
+        if (denied) window.localStorage.setItem(ATTENTION_DENIED_KEY, '1')
+      } catch {
+        /* private mode: the prompt simply reappears next launch */
+      }
+    }
+    function notificationDeniedBefore() {
+      try {
+        return window.localStorage.getItem(ATTENTION_DENIED_KEY) === '1'
+      } catch {
+        return false
+      }
+    }
+
+    /** Per-workspace grouping; the guide answers "which project", so it groups by that. */
+    function attentionGroups(sessions) {
+      const groups = []
+      const index = new Map()
+      for (const session of sessions) {
+        const name = session.workspace || session.dir || ''
+        const key = name.toLowerCase()
+        let group = index.get(key)
+        if (!group) {
+          group = { key, name, sessions: [] }
+          index.set(key, group)
+          groups.push(group)
+        }
+        group.sessions.push(session)
+      }
+      return groups
+    }
+
+    /**
+     * The counts that drive the pill, the title and the badge. `read` only
+     * suppresses `done`/`error`: `waiting` is never dismissible, because a
+     * blocked agent stays blocked until the human answers it.
+     */
+    function attentionSummary(snapshot) {
+      const read = snapshot?.read ?? {}
+      const sessions = snapshot?.sessions ?? []
+      const counts = { waiting: 0, error: 0, done: 0, running: 0, idle: 0 }
+      let unread = 0
+      for (const session of sessions) {
+        const state = ATTENTION_STATE_ORDER.includes(session.state) ? session.state : 'idle'
+        counts[state] += 1
+        if (state !== 'running' && state !== 'idle' && !read[session.sessionId]) unread += 1
+      }
+      // What the pill is coloured by: the worst state that still needs a human.
+      let worst = null
+      if (sessions.some((session) => session.state === 'waiting')) worst = 'waiting'
+      else if (sessions.some((session) => session.state === 'error' && !read[session.sessionId])) worst = 'error'
+      else if (sessions.some((session) => session.state === 'done' && !read[session.sessionId])) worst = 'done'
+      return { counts, unread, worst, total: sessions.length }
+    }
+
+    /** `just now` / `3 min ago` / `2 h ago` / `4 d ago`, from an epoch-ms stamp. */
+    function attentionAgo(at, t) {
+      if (typeof at !== 'number' || !Number.isFinite(at)) return ''
+      const seconds = Math.max(0, Math.round((Date.now() - at) / 1000))
+      if (seconds < 60) return t('attentionAgoJustNow')
+      const minutes = Math.round(seconds / 60)
+      if (minutes < 60) return t('attentionAgoMinutes', { count: minutes })
+      const hours = Math.round(minutes / 60)
+      if (hours < 24) return t('attentionAgoHours', { count: hours })
+      return t('attentionAgoDays', { count: Math.round(hours / 24) })
+    }
+
+    /** The one-line reason under a session title. */
+    function attentionReason(session, t) {
+      const key = ATTENTION_REASON_KEY[session?.reason]
+      if (key) return t(key)
+      return t('reasonUnknown')
+    }
+
+    /**
+     * Drop stale `done` reminders so the pill does not keep a green dot forever.
+     * `waiting`/`error` are kept: a blocked or failed session is still true
+     * regardless of the clock.
+     */
+    function pruneAttention(sessions) {
+      const now = Date.now()
+      return sessions.filter(
+        (session) =>
+          !(session.state === 'done' && typeof session.at === 'number' && now - session.at > attentionTuning.doneTtlMs),
+      )
+    }
+
+    let attentionInFlight = null
+    async function loadAttention(options = {}) {
+      if (attentionInFlight) return attentionInFlight
+      const run = (async () => {
+        try {
+          const body = await requestJson(ATTENTION_BASE)
+          // `enabled` is only present on the disabled branch of the contract; an
+          // absent field means "on". A Host that was told to stop this feature
+          // must leave no trace: no pill counts, no title prefix, no badge.
+          const disabled = body.enabled === false
+          const sessions = disabled ? [] : pruneAttention(Array.isArray(body.sessions) ? body.sessions : [])
+          const previous = attention.get()
+          attention.set({
+            sessions,
+            enabled: !disabled,
+            counts:
+              !disabled && body.counts && typeof body.counts === 'object'
+                ? { ...previous.counts, ...body.counts }
+                : { waiting: 0, error: 0, done: 0, running: 0, idle: 0 },
+            phase: 'ready',
+            error: null,
+            generatedAt: typeof body.generatedAt === 'number' ? body.generatedAt : Date.now(),
+          })
+          // A brand-new waiting set re-arms the call-out, so the arrow points
+          // again instead of staying collapsed after the first acknowledgement.
+          const waitingKey = sessions
+            .filter((session) => session.state === 'waiting')
+            .map((session) => session.sessionId)
+            .sort()
+            .join(',')
+          attention.set({ calloutSeen: previous.calloutSeen && previous.waitingKey === waitingKey, waitingKey })
+          const summary = attentionSummary(attention.get())
+          applyTitle(summary)
+          applyBadge(summary)
+          if (!options.silent) notifyAttention(previous, sessions, options.t)
+          return body
+        } catch (cause) {
+          // Attention is advisory: a failed read must never turn into an error
+          // banner over the reader's work. Keep the last known set in place.
+          attention.set({
+            phase: attention.get().phase === 'idle' ? 'error' : attention.get().phase,
+            error: cause?.message ?? null,
+          })
+          return null
+        } finally {
+          attentionInFlight = null
+        }
+      })()
+      attentionInFlight = run
+      return run
+    }
+
+    // ── L2: document title + app badge ────────────────────────────────────
+    //
+    // The shell owns `document.title` (it projects the session title). To stay
+    // additive we only ever strip a prefix this plugin itself wrote, so a
+    // concurrent shell update can never accumulate `(1) (1) (1) `.
+    const TITLE_PREFIX_RE = /^\(\d+\)\s+/
+    let titleApplied = false
+    function applyTitle(summary) {
+      try {
+        if (typeof document === 'undefined') return
+        const bare = String(document.title ?? '').replace(TITLE_PREFIX_RE, '')
+        const count = summary.unread
+        if (count > 0) {
+          document.title = `(${count}) ${bare}`
+          titleApplied = true
+        } else if (titleApplied) {
+          document.title = bare
+          titleApplied = false
+        }
+      } catch {
+        /* a frozen title is not worth failing a poll over */
+      }
+    }
+    function resetTitle() {
+      try {
+        if (typeof document === 'undefined' || !titleApplied) return
+        document.title = String(document.title ?? '').replace(TITLE_PREFIX_RE, '')
+        titleApplied = false
+      } catch {
+        /* nothing to restore */
+      }
+    }
+    function applyBadge(summary) {
+      try {
+        if (typeof navigator === 'undefined') return
+        const count = summary.unread
+        if (count > 0 && typeof navigator.setAppBadge === 'function') void navigator.setAppBadge(count)
+        else if (count === 0 && typeof navigator.clearAppBadge === 'function') void navigator.clearAppBadge()
+      } catch {
+        /* the badge is a bonus, never a requirement */
+      }
+    }
+
+    // ── L1: OS notifications ──────────────────────────────────────────────
+    //
+    // Notified only for a *transition* into a loud state, only when the reader
+    // is not already looking at that session, and only with permission. The tag
+    // makes the platform replace rather than stack, and a batch window turns N
+    // simultaneous changes into one toast.
+    let notifyTimer = null
+    let notifyPending = []
+    /** The client session service, captured by `apply` so the guide can open a row. */
+    let sessionsService = null
+    function viewedSession() {
+      try {
+        return viewedSessionId(sessionsService)
+      } catch {
+        return null
+      }
+    }
+    function notificationBody(session, t) {
+      const title = String(session.title ?? '').trim()
+      const detail = session.detail ? String(session.detail).trim() : ''
+      if (detail) return title ? `${title} · ${detail}` : detail
+      return title || attentionReason(session, t)
+    }
+    function notifyAttention(previous, sessions, t) {
+      const tr = typeof t === 'function' ? t : fallbackTranslator
+      const before = new Map((previous.sessions ?? []).map((session) => [session.sessionId, session.state]))
+      const current = viewedSession()
+      const hidden = (() => {
+        try {
+          return typeof document !== 'undefined' && document.visibilityState === 'hidden'
+        } catch {
+          return false
+        }
+      })()
+      const fresh = []
+      for (const session of sessions) {
+        const state = session.state
+        if (!ATTENTION_LOUD.has(state)) continue
+        if (before.get(session.sessionId) === state) continue // no transition: the same fact again
+        // Silence cases: the reader is reading it right now (unless the window
+        // is hidden), and a completion elsewhere while the app is visible is
+        // already visible in the pill.
+        if (!hidden && session.sessionId === current) continue
+        if (state === 'done' && !hidden) continue
+        fresh.push(session)
+      }
+      if (fresh.length === 0) return
+      notifyPending.push(...fresh)
+      if (notifyTimer) return
+      notifyTimer = setTimeout(() => {
+        notifyTimer = null
+        const batch = notifyPending
+        notifyPending = []
+        flushNotifications(batch, tr)
+      }, attentionTuning.notifyBatchMs)
+    }
+    function flushNotifications(batch, t) {
+      if (notificationPermission() !== 'granted') return
+      try {
+        if (batch.length === 1) {
+          const session = batch[0]
+          const workspace = session.workspace || t('attentionUnknownWorkspace')
+          const titleKey =
+            session.state === 'waiting'
+              ? 'notifyWaitingTitle'
+              : session.state === 'error'
+                ? 'notifyErrorTitle'
+                : 'notifyDoneTitle'
+          const notification = new window.Notification(t(titleKey, { workspace }), {
+            body: notificationBody(session, t),
+            // One tag per session+state: the platform replaces rather than stacks.
+            tag: `dsh-attention-${session.sessionId}-${session.state}`,
+            silent: session.state === 'done',
+          })
+          notification.onclick = () => {
+            try {
+              window.focus?.()
+            } catch {
+              /* some platforms refuse focus from a notification */
+            }
+            attention.set({ open: true })
+            openSession(session.sessionId)
+            notification.close?.()
+          }
+        } else {
+          const notification = new window.Notification(t('notifyBatchTitle', { count: batch.length }), {
+            body: batch
+              .slice(0, 4)
+              .map((session) => `${session.workspace || t('attentionUnknownWorkspace')} · ${attentionReason(session, t)}`)
+              .join('\n'),
+            tag: 'dsh-attention-batch',
+          })
+          notification.onclick = () => {
+            try {
+              window.focus?.()
+            } catch {
+              /* focus is a courtesy */
+            }
+            attention.set({ open: true })
+            notification.close?.()
+          }
+        }
+      } catch {
+        /* a refused constructor (permission revoked mid-flight) is not fatal */
+      }
+    }
+
+    /** Ask for notification permission — only ever from an explicit click. */
+    async function requestNotificationPermission() {
+      try {
+        if (!hasNotifications()) return 'unsupported'
+        if (notificationDeniedBefore()) return 'denied'
+        const result = await window.Notification.requestPermission()
+        rememberNotificationAsked(result !== 'granted')
+        attention.set({ permission: result })
+        return result
+      } catch {
+        return 'denied'
+      }
+    }
+
+    /** Open one session from the guide, and remember that it was acknowledged. */
+    function openSession(sessionId) {
+      try {
+        sessionsService?.open?.(sessionId)
+      } catch {
+        /* an unopenable row must not break the panel */
+      }
+      const snapshot = attention.get()
+      const session = (snapshot.sessions ?? []).find((entry) => entry.sessionId === sessionId)
+      // `waiting` is never cleared by opening: the agent is still blocked until
+      // the reader actually answers it inside that session.
+      if (session && session.state !== 'waiting') {
+        attention.set({ read: { ...snapshot.read, [sessionId]: true } })
+        applyTitle(attentionSummary(attention.get()))
+      }
+    }
+
+    function markAllAttentionRead() {
+      const snapshot = attention.get()
+      const read = { ...snapshot.read }
+      for (const session of snapshot.sessions ?? []) {
+        if (session.state !== 'waiting') read[session.sessionId] = true
+      }
+      attention.set({ read, calloutSeen: true })
+      applyTitle(attentionSummary(attention.get()))
+    }
+
     // ── views ─────────────────────────────────────────────────────────────
     function FileRow(props) {
       const { file, active, onSelect } = props
@@ -1607,6 +2180,277 @@ window.__ModuleLoader__.load({
       )
     }
 
+    /** Measure the pill so the guide panel can sit beside it. */
+    function measurePill(event) {
+      try {
+        const element = event?.currentTarget ?? event?.target
+        const box = element?.getBoundingClientRect?.()
+        if (!box || typeof box.bottom !== 'number') return null
+        const viewportHeight = window.innerHeight || 0
+        return {
+          left: Math.max(8, box.right + 8),
+          // Align the panel's bottom with the pill, so it opens upward beside
+          // the sidebar and never covers the workspace list it points at.
+          bottom: Math.max(8, viewportHeight - box.bottom),
+        }
+      } catch {
+        return null
+      }
+    }
+
+    /**
+     * The always-visible pill at the sidebar foot.
+     *
+     * It is registered into `sidebar.footer.action` rather than
+     * `sidebar.workspaces`: that seat is `single` and owned by ui-workspace, so
+     * replacing it would replace the whole session browser. The foot seat is a
+     * `list`, which is exactly "add one more control here".
+     */
+    function AttentionPill(props) {
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      const snapshot = useAttention()
+      const summary = attentionSummary(snapshot)
+      const rail = props.wide === false
+
+      // Poll while this surface is mounted. The visible/hidden cadence is the
+      // whole freshness story: no event feed exists for unopened sessions.
+      React.useEffect(() => {        let timer = null
+        let disposed = false
+        const isHidden = () => {
+          try {
+            return typeof document !== 'undefined' && document.visibilityState === 'hidden'
+          } catch {
+            return false
+          }
+        }
+        const tick = async () => {
+          if (disposed) return
+          await loadAttention({ t })
+          if (disposed) return
+          timer = setTimeout(tick, isHidden() ? attentionTuning.pollHiddenMs : attentionTuning.pollVisibleMs)
+        }
+        void loadAttention({ t, silent: true })
+        timer = setTimeout(tick, attentionTuning.pollVisibleMs)
+        const onVisible = () => {
+          // Coming back from another window is exactly when a stale count is
+          // most misleading, so refresh immediately rather than on the tick.
+          if (!isHidden()) void loadAttention({ t })
+        }
+        const canWatch = typeof document !== 'undefined' && typeof document.addEventListener === 'function'
+        if (canWatch) document.addEventListener('visibilitychange', onVisible)
+        return () => {
+          disposed = true
+          if (timer) clearTimeout(timer)
+          if (canWatch) document.removeEventListener('visibilitychange', onVisible)
+        }
+      }, [])
+
+      const worst = summary.worst
+      // `attentionEnabled: false` on the Host means the reader turned this
+      // feature off: claim no space in the sidebar at all.
+      if (snapshot.enabled === false) return null
+      const label = rail
+        ? ''
+        : worst === 'waiting'
+          ? t('attentionPillWaiting', { count: summary.counts.waiting })
+          : worst === 'error'
+            ? t('attentionPillError', { count: summary.counts.error })
+            : worst === 'done'
+              ? t('attentionPillDone', { count: summary.unread })
+              : t('attentionPillClear')
+
+      // The call-out is the "pointer": it says out loud that something above in
+      // this list needs a click, and collapses once the reader has seen it.
+      const callout =
+        !rail && worst === 'waiting' && snapshot.calloutSeen !== true
+          ? h('span', { className: 'dshAt_callout' }, t('attentionCalloutWaiting', { count: summary.counts.waiting }))
+          : null
+
+      const openPanel = (event) => {
+        const next = !attention.get().open
+        if (next) {
+          // Opening the panel is "seen": the arrow has done its job.
+          attention.set({ open: true, anchor: measurePill(event), calloutSeen: true })
+          void loadAttention({ t })
+        } else {
+          attention.set({ open: false })
+        }
+      }
+
+      return h(
+        'div',
+        { className: 'dshAt_root' },
+        h(
+          'button',
+          {
+            type: 'button',
+            className: 'dshAt_pill',
+            'data-state': worst ?? 'clear',
+            'data-rail': rail ? 'true' : 'false',
+            'aria-haspopup': 'dialog',
+            'aria-expanded': snapshot.open ? 'true' : 'false',
+            'aria-label': `${t('attentionPanel')} · ${label || t('attentionPillClear')}`,
+            title: `${t('attentionPanel')}\n${t('attentionQuietLine')}`,
+            onClick: openPanel,
+          },
+          worst === 'waiting' ? h('span', { className: 'dshAt_caret', 'aria-hidden': 'true' }, '▲') : null,
+          h('span', { className: 'dshAt_dot', 'data-state': worst ?? 'clear' }),
+          rail ? null : h('span', { className: 'dshAt_text' }, label),
+        ),
+        callout,
+      )
+    }
+
+    /**
+     * The guide panel: every session that needs a human, grouped by the
+     * workspace it belongs to — the actual question ("which project?") is
+     * answered by the group header, not by a path the reader has to parse.
+     */
+    function AttentionPanel(props) {
+      const t = typeof props.t === 'function' ? props.t : fallbackTranslator
+      const snapshot = useAttention()
+      const summary = attentionSummary(snapshot)
+      const { open, anchor, sessions } = snapshot
+
+      React.useEffect(() => {
+        if (!open) return undefined
+        const onKey = (event) => {
+          if (event.key === 'Escape') attention.set({ open: false })
+        }
+        const onPointerDown = (event) => {
+          const target = event?.target
+          if (typeof target?.closest === 'function' && (target.closest('.dshAt_pop') || target.closest('.dshAt_pill'))) return
+          attention.set({ open: false })
+        }
+        window.addEventListener('keydown', onKey)
+        const canWatch = typeof document !== 'undefined' && typeof document.addEventListener === 'function'
+        if (canWatch) document.addEventListener('pointerdown', onPointerDown, true)
+        return () => {
+          window.removeEventListener('keydown', onKey)
+          if (canWatch) document.removeEventListener('pointerdown', onPointerDown, true)
+        }
+      }, [open])
+
+      if (!open) return null
+      // The panel follows the same switch as the pill: no feature, no surface.
+      if (snapshot.enabled === false) return null
+
+      const placement = anchor ? { left: `${anchor.left}px`, bottom: `${anchor.bottom}px` } : undefined
+      // A `running` session is informational only; the guide is about what the
+      // reader may need to act on, so it sorts the loud states first and keeps
+      // running/idle at the bottom rather than hiding them.
+      const ordered = [...sessions].sort((left, right) => {
+        const rank = ATTENTION_STATE_ORDER.indexOf(left.state) - ATTENTION_STATE_ORDER.indexOf(right.state)
+        if (rank !== 0) return rank
+        return (right.at ?? 0) - (left.at ?? 0)
+      })
+      const groups = attentionGroups(ordered)
+      const permission = snapshot.permission
+      const canAsk = permission === 'default' && !notificationAsked()
+      const read = snapshot.read ?? {}
+
+      return h(
+        'div',
+        { className: 'dshAt_pop', role: 'dialog', 'aria-label': t('attentionPanel'), style: placement },
+        h(
+          'div',
+          { className: 'dshAt_head' },
+          h('h3', { className: 'dshAt_title' }, t('attentionPanel')),
+          h(
+            'span',
+            { className: 'dshAt_headMeta', 'aria-live': 'polite' },
+            t('attentionWatching', { seconds: Math.round(attentionTuning.pollVisibleMs / 1000) }),
+          ),
+          summary.unread > 0
+            ? h('button', { type: 'button', className: 'dshCl_btn', onClick: () => markAllAttentionRead() }, t('attentionMarkAllRead'))
+            : null,
+          h('button', { type: 'button', className: 'dshCl_iconBtn', 'aria-label': t('close'), onClick: () => attention.set({ open: false }) }, '✕'),
+        ),
+        h(
+          'div',
+          { className: 'dshAt_body' },
+          ordered.length === 0
+            ? h('div', { className: 'dshAt_empty' }, t('attentionEmpty'))
+            : groups.map((group) =>
+                h(
+                  'div',
+                  { className: 'dshAt_group', key: group.key || group.name },
+                  h(
+                    'div',
+                    { className: 'dshAt_groupHead' },
+                    h('span', { className: 'dshAt_groupName', title: group.name }, group.name || t('attentionUnknownWorkspace')),
+                    h('span', { className: 'dshAt_groupCount' }, String(group.sessions.length)),
+                  ),
+                  group.sessions.map((session) =>
+                    h(
+                      'button',
+                      {
+                        type: 'button',
+                        key: session.sessionId,
+                        className: `dshAt_row${read[session.sessionId] ? ' dshAt_rowRead' : ''}`,
+                        title: `${session.title ?? ''}${session.dir ? `\n${session.dir}` : ''}`,
+                        onClick: () => openSession(session.sessionId),
+                      },
+                      h('span', { className: 'dshAt_stateIcon', 'data-state': session.state, 'aria-hidden': 'true' }, ATTENTION_ICON[session.state] ?? '·'),
+                      h(
+                        'span',
+                        { className: 'dshAt_rowMain' },
+                        h('span', { className: 'dshAt_rowTitle' }, session.title || session.sessionId),
+                        h(
+                          'span',
+                          { className: 'dshAt_rowMeta' },
+                          h('span', { className: 'dshAt_rowReason' }, `${t(ATTENTION_STATE_KEY[session.state] ?? 'stateIdle')} · ${attentionReason(session, t)}`),
+                          h('span', { className: 'dshAt_rowDot' }, '·'),
+                          h('span', null, attentionAgo(session.at, t)),
+                        ),
+                      ),
+                      h('span', { className: 'dshAt_openHint' }, t('attentionOpen')),
+                    ),
+                  ),
+                ),
+              ),
+        ),
+        ordered.length > 0
+          ? h(
+              'div',
+              { className: 'dshAt_legend' },
+              summary.counts.waiting > 0
+                ? h('span', { className: 'dshAt_legendItem' }, h('span', { className: 'dshAt_dot', 'data-state': 'waiting' }), t('stateWaiting'))
+                : null,
+              summary.counts.error > 0
+                ? h('span', { className: 'dshAt_legendItem' }, h('span', { className: 'dshAt_dot', 'data-state': 'error' }), t('stateError'))
+                : null,
+              summary.counts.done > 0
+                ? h('span', { className: 'dshAt_legendItem' }, h('span', { className: 'dshAt_dot', 'data-state': 'done' }), t('stateDone'))
+                : null,
+              summary.counts.running > 0
+                ? h('span', { className: 'dshAt_legendItem' }, h('span', { className: 'dshAt_dot', 'data-state': 'running' }), t('stateRunning'))
+                : null,
+            )
+          : null,
+        h(
+          'div',
+          { className: 'dshAt_foot' },
+          h(
+            'span',
+            { className: 'dshAt_footText' },
+            permission === 'granted'
+              ? t('attentionQuietLine')
+              : permission === 'denied'
+                ? t('attentionNotificationsBlocked')
+                : t('attentionNotificationsOff'),
+          ),
+          canAsk
+            ? h(
+                'button',
+                { type: 'button', className: 'dshCl_btn', onClick: () => void requestNotificationPermission() },
+                t('attentionEnableNotifications'),
+              )
+            : null,
+        ),
+      )
+    }
+
     function ChangelistChip(props) {
       const t = typeof props.t === 'function' ? props.t : fallbackTranslator
       const snapshot = useStore()
@@ -1701,6 +2545,13 @@ window.__ModuleLoader__.load({
 
     return {
       inject: ['slots', 'locale', 'sessions'],
+      /**
+       * Test seam, not API. The poll cadence and the notification batch window
+       * are wall-clock timings; exposing them here lets the verification suite
+       * drive a transition without sleeping five seconds. Nothing in the
+       * plugin reads this object except the defaults it was born with.
+       */
+      attentionInternals: { tuning: attentionTuning, store: attention, load: loadAttention, summary: attentionSummary },
       apply(ctx) {
         if (typeof ctx.locale?.register === 'function') {
           ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'changelist: dictionaries')
@@ -1708,6 +2559,8 @@ window.__ModuleLoader__.load({
         const t = typeof ctx.locale?.bind === 'function' ? ctx.locale.bind(NS) : fallbackTranslator
         const getViewedSessionId = () => viewedSessionId(ctx.sessions)
         const subscribeViewedSession = (listener) => watchViewedSession(ctx.sessions, listener)
+        // The attention guide opens sessions, so it needs the service too.
+        sessionsService = ctx.sessions ?? null
 
         ctx.effect(() => {
           const tagId = '@local/dsh-changelist/changelist.css'
@@ -1754,6 +2607,55 @@ window.__ModuleLoader__.load({
             Popover,
           ),
         )
+
+        // ── cross-project attention ───────────────────────────────────────
+        // L3a: the always-visible status pill at the sidebar foot. It lives in
+        // the `sidebar.footer.action` list seat because `sidebar.workspaces` is
+        // `single` and owned by ui-workspace — replacing that would replace the
+        // whole session browser just to add a badge.
+        ctx.slots.inject('sidebar.footer.action', () =>
+          ctx.slots.register(
+            {
+              name: 'sidebar.footer.action',
+              id: ATTENTION_PILL_ID,
+              order: 0,
+              locale: NS,
+            },
+            AttentionPill,
+          ),
+        )
+        // L3b: the guide panel it opens, in the overlay layer so it can point
+        // at the pill from outside the sidebar's own scroll container.
+        ctx.slots.inject('shell.overlay', () =>
+          ctx.slots.register(
+            {
+              name: 'shell.overlay',
+              id: ATTENTION_PANEL_ID,
+              order: 0,
+              locale: NS,
+            },
+            AttentionPanel,
+          ),
+        )
+
+        // Seed what the platform lets us know about L1/L2 once, at mount. Asking
+        // for permission here would be hostile: it waits for an explicit click.
+        // The poll itself, including the visibility refresh, belongs to the
+        // pill's own effect — that surface is the one that is always mounted.
+        ctx.effect(() => {
+          attention.set({ permission: notificationPermission(), read: {}, calloutSeen: false, waitingKey: '' })
+          return () => {
+            // Leaving the composition must not leave a `(2) ` prefix behind.
+            resetTitle()
+            applyBadge({ unread: 0 })
+            if (notifyTimer) {
+              clearTimeout(notifyTimer)
+              notifyTimer = null
+            }
+            notifyPending = []
+            attention.set({ open: false })
+          }
+        }, 'changelist: attention lifecycle')
       },
     }
   },

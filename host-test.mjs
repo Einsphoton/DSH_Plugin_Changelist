@@ -1,6 +1,6 @@
 /**
  * Host-half verification: drives the real route handlers against the real git
- * fixture, and checks that `apply` mounts exactly the three fenced routes.
+ * fixture, and checks that `apply` mounts exactly the four fenced routes.
  *
  * Sandbox note: `execFile` is replaced with a file-redirecting stand-in because
  * this authoring session forbids piped child stdio. The plugin's own runner
@@ -13,6 +13,7 @@ import os from 'node:os'
 import path from 'node:path'
 
 import { apply, collectTargets, createRoutes, gitEnvironment, safeRepoPath, ROUTES } from './index.js'
+import { createAttentionRegistry, emptyAttentionCounts, ATTENTION_SCHEMA_VERSION } from './lib/attention.js'
 import { createFileReader, inspectWorkspace } from './lib/git.js'
 import {
   FAKE_P4_CLIENT,
@@ -245,13 +246,19 @@ const applyCtx = {
     },
   },
 }
-apply(applyCtx, { allowedPaths: [repo], diagnosticsPath: path.join(FIXTURE_ROOT, 'diag', 'host.log') }, { execFile: fileRedirectExecFile })
-check('three routes registered', registered.length, 3)
-check('route paths', registered.map((r) => r.path).sort(), [ROUTES.diff, ROUTES.state, ROUTES.targets].sort())
+apply(applyCtx, { allowedPaths: [repo], diagnosticsPath: path.join(FIXTURE_ROOT, 'diag', 'host.log') }, { execFile: fileRedirectExecFile, on: () => () => {} })
+// Four routes now: the three changelist reads plus the cross-session attention
+// read. The route list is derived from ROUTES, so it cannot disagree with the
+// contract even if a fifth route is added later.
+const MOUNTED_ROUTES = Object.values(ROUTES)
+check('three changelist routes plus attention', registered.length, 4)
+check('route paths', registered.map((r) => r.path).sort(), MOUNTED_ROUTES.sort())
 checkThat('every route sits inside the /api fence', registered.every((r) => r.path.startsWith('/api/')), registered.map((r) => r.path).join())
 check('every route is GET with a buffered body', registered.every((r) => r.methods.length === 1 && r.methods[0] === 'GET' && r.requestBody === 'buffered'), true)
 check('registrations are effect-owned', applied.length, 1)
-checkThat('the effect yields four disposers', applied[0].disposers.length === 4, JSON.stringify(applied[0].label))
+// One disposer each for the unmount log and the four routes, plus the attention
+// registry's `session/event` subscription: unload must release all six.
+checkThat('the effect yields six disposers', applied[0].disposers.length === 6, JSON.stringify(applied[0].disposers.length))
 checkThat(
   'no yielded value is a promise',
   applied[0].disposers.every((entry) => typeof entry === 'function'),
@@ -546,6 +553,409 @@ const routeLines = fs
   .map((line) => JSON.parse(line))
   .filter((entry) => entry.event === 'route' && entry.route === 'state')
 check('two requests were answered by one read', routeLines.length, 1)
+
+console.log('8. cross-project attention: the registry folds session events')
+// The attention route answers "is any session, in any workspace, waiting for
+// me". Its only input is the Host's own `session/event` stream, so the registry
+// takes `on` and `now` as seams: the whole state machine is exercised here
+// without a Cordis context, a real clock, or any subprocess.
+const attentionLog = path.join(FIXTURE_ROOT, 'diag', 'attention.log')
+
+/** A fake `ctx.on` that records listeners, exactly like the Cordis event service. */
+function captureListeners() {
+  const listeners = []
+  const subscription = (eventName, listener) => {
+    listeners.push({ eventName, listener, live: true })
+    return () => {
+      const entry = listeners.find((candidate) => candidate.listener === listener)
+      if (entry) entry.live = false
+    }
+  }
+  Object.defineProperty(subscription, 'live', {
+    get: () => listeners.filter((entry) => entry.live).length,
+  })
+  subscription.listeners = listeners
+  return subscription
+}
+/** Emit to every live listener, exactly like the Host would. */
+function emitAll(on, session, event) {
+  for (const entry of on.listeners) if (entry.live) entry.listener(session, event)
+}
+const sessionIn = (id, dir, title) => ({ id, header: { cwd: dir, ...(title ? { title } : {}) } })
+// A real Host event carries its own `time`; leaving it out is how these cases
+// pin the injected clock instead, so `since`/`at` are deterministic.
+const event = (type, data, time) => ({ type, ...(time === undefined ? {} : { time }), data })
+
+// 8a. a turn starts, then completes: running -> done, and `since` advances.
+const clockA = { t: 1_000_000 }
+const onA = captureListeners()
+const regA = createAttentionRegistry({ on: onA, now: () => clockA.t })
+check('the session/event listener is subscribed once', onA.listeners.map((entry) => entry.eventName), ['session/event'])
+checkThat('the registry starts empty', regA.size === 0 && regA.snapshot().sessions.length === 0)
+emitAll(onA, sessionIn('s1', 'C:/work/Alpha', 'Alpha 会话'), event('turn/start', { turn: 3 }))
+const runningA = regA.snapshot()
+check('turn/start makes the session running', [runningA.sessions[0]?.state, runningA.sessions[0]?.reason, runningA.sessions[0]?.running], [
+  'running',
+  'turn-start',
+  true,
+])
+check('turn/start records the turn and its start time', [runningA.sessions[0]?.turn, runningA.sessions[0]?.since], [3, 1_000_000])
+clockA.t = 1_004_000
+emitAll(onA, sessionIn('s1', 'C:/work/Alpha', 'Alpha 会话'), event('turn/end', { turn: 3, reason: { kind: 'completed' } }))
+const doneA = regA.snapshot()
+check('a completed turn moves the session to done', [doneA.sessions[0]?.state, doneA.sessions[0]?.reason, doneA.sessions[0]?.running], [
+  'done',
+  'turn-end',
+  false,
+])
+check('done restarts `since` and moves `at`', [doneA.sessions[0]?.since, doneA.sessions[0]?.at], [1_004_000, 1_004_000])
+check('counts always carry all five states', Object.keys(doneA.counts).sort(), ['done', 'error', 'idle', 'running', 'waiting'])
+check('the counts describe the returned list', doneA.counts.done, 1)
+regA.dispose()
+
+// 8b. an error carries the provider's own words, bounded.
+const clockB = { t: 2_000_000 }
+const onB = captureListeners()
+const regB = createAttentionRegistry({ on: onB, now: () => clockB.t })
+emitAll(onB, sessionIn('s2', '/home/u/Beta'), event('turn/start', { turn: 1 }))
+clockB.t = 2_001_000
+const longMessage = 'provider exploded: '.repeat(40)
+emitAll(onB, sessionIn('s2', '/home/u/Beta'), event('turn/end', { turn: 1, reason: { kind: 'error', error: { message: longMessage, code: 'OVERLOADED' } } }))
+const errorB = regB.snapshot()
+check('a failed turn is an error', [errorB.sessions[0]?.state, errorB.sessions[0]?.reason, errorB.sessions[0]?.running], [
+  'error',
+  'turn-error',
+  false,
+])
+checkThat('the error detail is truncated', errorB.sessions[0]?.detail.length <= 160, String(errorB.sessions[0]?.detail.length))
+checkThat('the error detail keeps the provider message', String(errorB.sessions[0]?.detail).startsWith('provider exploded'), errorB.sessions[0]?.detail)
+// A failure with no message still reports its stable code.
+emitAll(onB, sessionIn('s3', '/home/u/Beta'), event('turn/end', { turn: 2, reason: { kind: 'error', error: { code: 'RATE_LIMITED' } } }))
+const errorCode = regB.snapshot().sessions.find((entry) => entry.sessionId === 's3')
+check('a codeless failure falls back to the code', [errorCode?.state, errorCode?.detail], ['error', 'RATE_LIMITED'])
+regB.dispose()
+
+// 8c. blocked waits for a human; aborted and unknown are idle.
+const clockC = { t: 3_000_000 }
+const onC = captureListeners()
+const regC = createAttentionRegistry({ on: onC, now: () => clockC.t })
+emitAll(onC, sessionIn('s4', 'D:/work/Alpha'), event('turn/start', { turn: 7 }))
+emitAll(onC, sessionIn('s4', 'D:/work/Alpha'), event('turn/end', { turn: 7, reason: { kind: 'blocked', detail: '等待审批：写入工作区' } }))
+const blockedC = regC.snapshot().sessions[0]
+check('a blocked turn waits for a human', [blockedC?.state, blockedC?.reason, blockedC?.running], ['waiting', 'blocked', true])
+checkThat('the blocked detail survives', blockedC?.detail === '等待审批：写入工作区', String(blockedC?.detail))
+emitAll(onC, sessionIn('s5', 'D:/work/Beta'), event('turn/start', { turn: 1 }))
+clockC.t = 3_001_000
+emitAll(onC, sessionIn('s5', 'D:/work/Beta'), event('turn/end', { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user' } } }))
+check('an aborted turn is idle', [regC.snapshot().sessions.find((entry) => entry.sessionId === 's5')?.state], ['idle'])
+emitAll(onC, sessionIn('s6', 'D:/work/Gamma'), event('turn/end', { turn: 1, reason: { kind: 'something-new' } }))
+check('an unknown end reason is idle, not an error', [regC.snapshot().sessions.find((entry) => entry.sessionId === 's6')?.state], ['idle'])
+// A turn that never started and has no end reason at all is idle too.
+emitAll(onC, sessionIn('s7', 'D:/work/Gamma'), event('turn/end', { turn: 1 }))
+check('a turn/end with no reason is idle', [regC.snapshot().sessions.find((entry) => entry.sessionId === 's7')?.state], ['idle'])
+regC.dispose()
+
+// 8d. activity keeps a running turn running without restarting `since`.
+const clockD = { t: 4_000_000 }
+const onD = captureListeners()
+const regD = createAttentionRegistry({ on: onD, now: () => clockD.t })
+emitAll(onD, sessionIn('s8', 'E:/work/Alpha'), event('turn/start', { turn: 2 }))
+clockD.t = 4_005_000
+for (const type of ['step/start', 'tool/call', 'tool/result', 'assistant/message']) {
+  emitAll(onD, sessionIn('s8', 'E:/work/Alpha'), event(type, { turn: 2, step: 1 }))
+}
+const activityD = regD.snapshot()
+check('activity keeps the turn running', [activityD.sessions[0]?.state, activityD.sessions[0]?.reason], ['running', 'activity'])
+check('activity moves `at` but keeps `since`', [activityD.sessions[0]?.since, activityD.sessions[0]?.at], [4_000_000, 4_005_000])
+// An approval question is the canonical "waiting", and answering it resumes.
+emitAll(onD, sessionIn('s9', 'E:/work/Beta'), event('turn/start', { turn: 1 }))
+emitAll(onD, sessionIn('s9', 'E:/work/Beta'), event('approval/asked', { id: 'a1', toolName: 'Bash' }))
+check('an approval question waits for a human', [regD.snapshot().sessions.find((s) => s.sessionId === 's9')?.state, regD.snapshot().sessions.find((s) => s.sessionId === 's9')?.reason], ['waiting', 'approval'])
+emitAll(onD, sessionIn('s9', 'E:/work/Beta'), event('approval/decided', { id: 'a1', outcome: 'allowed-once' }))
+check('answering it resumes the turn', [regD.snapshot().sessions.find((s) => s.sessionId === 's9')?.state], ['running'])
+regD.dispose()
+
+// 8e. ordering: worst state first, newest evidence first inside a state.
+const clockE = { t: 5_000_000 }
+const onE = captureListeners()
+const regE = createAttentionRegistry({ on: onE, now: () => clockE.t })
+const seed = (id, dir, state) => {
+  clockE.t += 1_000
+  if (state === 'waiting') emitAll(onE, sessionIn(id, dir), event('turn/end', { turn: 1, reason: { kind: 'blocked' } }))
+  else if (state === 'error') emitAll(onE, sessionIn(id, dir), event('turn/end', { turn: 1, reason: { kind: 'error', error: { message: 'x' } } }))
+  else if (state === 'done') emitAll(onE, sessionIn(id, dir), event('turn/end', { turn: 1, reason: { kind: 'completed' } }))
+  else if (state === 'running') emitAll(onE, sessionIn(id, dir), event('turn/start', { turn: 1 }))
+  else emitAll(onE, sessionIn(id, dir), event('turn/end', { turn: 1, reason: { kind: 'aborted' } }))
+  return clockE.t
+}
+seed('idle-1', 'F:/w/Idle', 'idle')
+seed('running-1', 'F:/w/Running', 'running')
+const doneOlder = seed('done-old', 'F:/w/Done', 'done')
+seed('error-1', 'F:/w/Error', 'error')
+seed('waiting-1', 'F:/w/Wait', 'waiting')
+const doneNewer = seed('done-new', 'F:/w/Done', 'done')
+const ordered = regE.snapshot().sessions
+check('states sort waiting, error, done, running, idle', ordered.map((entry) => entry.state), [
+  'waiting',
+  'error',
+  'done',
+  'done',
+  'running',
+  'idle',
+])
+check('newest evidence sorts first inside a state', ordered.filter((entry) => entry.state === 'done').map((entry) => entry.sessionId), [
+  'done-new',
+  'done-old',
+])
+checkThat('that is newest-first, not insertion order', doneNewer > doneOlder)
+regE.dispose()
+
+// 8f. the session cap and the retention window.
+const clockF = { t: 6_000_000 }
+const onF = captureListeners()
+const regF = createAttentionRegistry({ on: onF, now: () => clockF.t, limits: { maxSessions: 3, retentionMs: 10_000 } })
+for (let index = 0; index < 6; index++) {
+  clockF.t += 500
+  emitAll(onF, sessionIn(`cap-${index}`, `G:/w/Cap${index}`), event('turn/end', { turn: 1, reason: { kind: 'completed' } }))
+}
+const capSnapshot = regF.snapshot()
+check('attentionMaxSessions caps the answer', capSnapshot.sessions.length, 3)
+check('the cap keeps the newest sessions', capSnapshot.sessions.map((entry) => entry.sessionId), ['cap-5', 'cap-4', 'cap-3'])
+check('the counts describe the capped list, not the map', [capSnapshot.counts.done, regF.size], [3, 6])
+// Retention: everything older than 10 s of evidence disappears on the next read.
+clockF.t += 20_000
+emitAll(onF, sessionIn('fresh-1', 'G:/w/Fresh'), event('turn/end', { turn: 1, reason: { kind: 'completed' } }))
+const pruned = regF.snapshot()
+check('retention prunes records with no recent evidence', pruned.sessions.map((entry) => entry.sessionId), ['fresh-1'])
+check('pruning shrinks the map too', regF.size, 1)
+regF.dispose()
+
+// 8g. a malformed event never breaks the Host or the registry.
+const clockG = { t: 7_000_000 }
+const onG = captureListeners()
+const regG = createAttentionRegistry({ on: onG, now: () => clockG.t })
+emitAll(onG, sessionIn('good-1', 'H:/w/Good'), event('turn/start', { turn: 1 }))
+const hostile = { get type() { throw new Error('type exploded') } }
+const hostileData = { type: 'turn/end', time: 7_000_000, data: { get reason() { throw new Error('reason exploded') } } }
+for (const [session, badEvent] of [
+  [null, event('turn/start', { turn: 1 })],
+  [undefined, null],
+  [{}, event('turn/start', { turn: 1 })],
+  [{ id: 'no-cwd' }, event('turn/start', { turn: 1 })],
+  [{ id: '' }, event('turn/start', { turn: 1 })],
+  ['not a session', event('turn/start', { turn: 1 })],
+  [sessionIn('good-1', 'H:/w/Good'), null],
+  [sessionIn('good-1', 'H:/w/Good'), 'not an event'],
+  [sessionIn('good-1', 'H:/w/Good'), {}],
+  [sessionIn('good-1', 'H:/w/Good'), hostile],
+  [sessionIn('good-1', 'H:/w/Good'), hostileData],
+]) {
+  emitAll(onG, session, badEvent)
+}
+// A session whose header getter throws is skipped, not fatal.
+emitAll(onG, { id: 'bad-header', get header() { throw new Error('header exploded') } }, event('turn/start', { turn: 1 }))
+const survived = regG.snapshot()
+checkThat('the registry survives every malformed event', Array.isArray(survived.sessions))
+check('a session with no cwd is skipped, not tracked', survived.sessions.some((entry) => entry.sessionId === 'no-cwd'), false)
+checkThat('the good session is still tracked after the poison', survived.sessions.some((entry) => entry.sessionId === 'good-1'))
+// A session store that throws must degrade, not propagate.
+const onH = captureListeners()
+const regH = createAttentionRegistry({
+  on: onH,
+  now: () => clockG.t,
+  sessions: {
+    get() {
+      throw new Error('store exploded')
+    },
+  },
+})
+emitAll(onH, { id: 'stub-1', header: { cwd: 'I:/w/Stub' } }, event('turn/start', { turn: 1 }))
+check('a throwing session store still tracks the event', regH.snapshot().sessions.map((entry) => entry.sessionId), ['stub-1'])
+regH.dispose()
+// No `on` at all: an empty view, never a crash — the route must still answer.
+const regNoOn = createAttentionRegistry({})
+check('a registry with no event source is empty but valid', [regNoOn.snapshot().sessions.length, regNoOn.snapshot().counts], [0, emptyAttentionCounts()])
+regNoOn.dispose()
+regG.dispose()
+
+// 8h. dispose() releases the subscription.
+const onI = captureListeners()
+const regI = createAttentionRegistry({ on: onI, now: () => 8_000_000 })
+emitAll(onI, sessionIn('dispose-1', 'J:/w/Dispose'), event('turn/start', { turn: 1 }))
+check('one live listener before dispose', onI.live, 1)
+regI.dispose()
+check('dispose removes the subscription', onI.live, 0)
+// A disposed registry ignores late events instead of resurrecting records.
+emitAll(onI, sessionIn('dispose-1', 'J:/w/Dispose'), event('turn/end', { turn: 1, reason: { kind: 'completed' } }))
+check('a disposed registry ignores late events', regI.snapshot().sessions.length, 0)
+regI.dispose()
+check('dispose is idempotent', onI.live, 0)
+
+console.log('9. the attention route')
+const attentionRegistered = []
+const attentionApplied = []
+const attentionRouteCtx = {
+  logger,
+  get: ctx.get,
+  on(eventName, listener) {
+    void eventName
+    void listener
+    return () => {}
+  },
+  effect(fn) {
+    const value = fn()
+    const disposers = typeof value === 'function' ? [value] : [...(value ?? [])]
+    attentionApplied.push(disposers)
+    return () => {}
+  },
+  connection: {
+    fetch: {
+      register(route) {
+        attentionRegistered.push(route)
+        return () => {}
+      },
+    },
+  },
+}
+apply(attentionRouteCtx, { allowedPaths: [repo], diagnostics: false, diagnosticsPath: attentionLog }, { execFile: fileRedirectExecFile })
+const attentionRoute = attentionRegistered.find((route) => route.path === ROUTES.attention)
+checkThat('the attention route is mounted with the other three', Boolean(attentionRoute), JSON.stringify(attentionRegistered.map((route) => route.path)))
+check('the mount is still four routes', attentionRegistered.length, 4)
+check('the attention route is GET+buffered and fenced', {
+  path: attentionRoute?.path,
+  methods: attentionRoute?.methods,
+  requestBody: attentionRoute?.requestBody,
+}, { path: '/api/changelist.attention', methods: ['GET'], requestBody: 'buffered' })
+checkThat('unloading releases the attention subscription too', attentionApplied[0].length === 6, JSON.stringify(attentionApplied[0].length))
+
+const attentionResponse = await attentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))
+check('the attention route answers 200', attentionResponse.status, 200)
+check('its content type is JSON', attentionResponse.headers.get('content-type'), 'application/json; charset=utf-8')
+const attentionBody = await attentionResponse.json()
+check('the attention answer is ok', attentionBody.ok, true)
+check('it carries the schema version', attentionBody.schemaVersion, ATTENTION_SCHEMA_VERSION)
+checkThat('generatedAt is an epoch-ms number, not a string', typeof attentionBody.generatedAt === 'number' && attentionBody.generatedAt > 1_600_000_000_000, String(attentionBody.generatedAt))
+check('it carries all five counts as numbers', attentionBody.counts, { waiting: 0, error: 0, done: 0, running: 0, idle: 0 })
+checkThat('it carries a sessions array', Array.isArray(attentionBody.sessions))
+// Authority is never widened: `dir` and `sessionId` are not inputs at all.
+const widened = await attentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}?dir=${encodeURIComponent('C:/Windows')}&sessionId=somebody-else`))
+const widenedBody = await widened.json()
+check('a dir/sessionId query widens nothing', [widened.status, widenedBody.ok, widenedBody.sessions.length], [200, true, 0])
+checkThat('and it is not an error surface', widenedBody.ok === true && widenedBody.message === undefined, JSON.stringify(widenedBody).slice(0, 160))
+const garbage = await attentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}?nonsense=1&dir=`))
+check('unknown query parameters are ignored, not 400', garbage.status, 200)
+
+// The registry wired into the route is the one the events reach: `apply()` hands
+// its `ctx.on` subscription to the same registry its handler reads from, so
+// emitting into the captured listener and then hitting the route proves the
+// whole path end to end with no fakes in between.
+const liveListeners = []
+const liveRoutes = []
+let unloadPlugin = null
+const liveCtx = {
+  logger,
+  get: ctx.get,
+  on(eventName, listener) {
+    liveListeners.push({ eventName, listener })
+    return () => {
+      const index = liveListeners.findIndex((entry) => entry.listener === listener)
+      if (index >= 0) liveListeners.splice(index, 1)
+    }
+  },
+  effect(fn) {
+    // Genuine generator effect: run every step, keep every yielded disposer, and
+    // hand back a function that unloads the plugin exactly like Cordis would.
+    const generator = fn()
+    const disposers = []
+    for (let step = generator.next(); !step.done; step = generator.next()) disposers.push(step.value)
+    unloadPlugin = () => {
+      for (const disposer of disposers) if (typeof disposer === 'function') disposer()
+    }
+    return () => {}
+  },
+  connection: { fetch: { register: (route) => (liveRoutes.push(route), () => {}) } },
+}
+apply(liveCtx, { allowedPaths: [repo], diagnostics: false }, { execFile: fileRedirectExecFile })
+check('the plugin subscribed to session/event', liveListeners.filter((entry) => entry.eventName === 'session/event').length, 1)
+check('the plugin mounted four routes', liveRoutes.length, 4)
+const liveAttentionRoute = liveRoutes.find((route) => route.path === ROUTES.attention)
+const beforeEvent = await (await liveAttentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))).json()
+check('a quiet Host reports an empty list, not an error', [beforeEvent.sessions.length, beforeEvent.counts.waiting], [0, 0])
+for (const entry of liveListeners.filter((candidate) => candidate.eventName === 'session/event')) {
+  entry.listener(sessionIn('live-1', 'K:/w/Live', '实时会话'), event('turn/start', { turn: 1 }))
+}
+const afterEvent = await (await liveAttentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))).json()
+check('an emitted event reaches the route answer', afterEvent.sessions.map((session) => [session.sessionId, session.state]), [
+  ['live-1', 'running'],
+])
+check('the row carries the workspace basename and the full dir', [afterEvent.sessions[0]?.workspace, afterEvent.sessions[0]?.dir], [
+  'Live',
+  'K:/w/Live',
+])
+check('and the title from the session header', afterEvent.sessions[0]?.title, '实时会话')
+check('and all timestamps are epoch-ms numbers', [typeof afterEvent.sessions[0]?.since, typeof afterEvent.sessions[0]?.at, typeof afterEvent.generatedAt], [
+  'number',
+  'number',
+  'number',
+])
+// Unloading the plugin must release the subscription: the Host keeps no listener.
+checkThat('the effect handed back an unloader', typeof unloadPlugin === 'function')
+unloadPlugin()
+check('unloading releases the plugin subscription', liveListeners.filter((entry) => entry.eventName === 'session/event').length, 0)
+const readOnlyAfterUnload = await (await liveAttentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))).json()
+check('a disposed registry answers empty, still ok', [readOnlyAfterUnload.ok, readOnlyAfterUnload.sessions.length], [true, 0])
+
+// 9b. attentionEnabled:false short-circuits, and the shape stays identical.
+const disabledRegistered = []
+const disabledApplied = []
+const disabledCtx = {
+  logger,
+  get: ctx.get,
+  on: () => () => {},
+  effect(fn) {
+    // The effect body is a generator: draining it is what performs the mounts.
+    const value = fn()
+    disabledApplied.push(typeof value === 'function' ? [value] : [...(value ?? [])])
+    return () => {}
+  },
+  connection: { fetch: { register: (route) => (disabledRegistered.push(route), () => {}) } },
+}
+apply(disabledCtx, { allowedPaths: [repo], diagnostics: false, attentionEnabled: false }, { execFile: fileRedirectExecFile })
+check('the disabled mount still owns every disposer', disabledApplied[0].length, 6)
+const disabledRoute = disabledRegistered.find((route) => route.path === ROUTES.attention)
+const disabledBody = await (await disabledRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))).json()
+check('attentionEnabled:false says so', [disabledBody.ok, disabledBody.enabled], [true, false])
+check('and still carries no sessions', disabledBody.sessions, [])
+check('and still carries all five zeroed counts', disabledBody.counts, { waiting: 0, error: 0, done: 0, running: 0, idle: 0 })
+check('and still carries the schema version', disabledBody.schemaVersion, ATTENTION_SCHEMA_VERSION)
+check('the disabled route is still mounted', disabledRegistered.length, 4)
+
+// 9c. a broken subsystem still answers ok:true.
+const brokenAttentionRoutes = createRoutes(
+  { logger, get: () => undefined },
+  { allowedPaths: [repo], diagnostics: false },
+  { execFile: fileRedirectExecFile, on: () => () => {} },
+)
+const missingService = await (await brokenAttentionRoutes.handleAttention()).json()
+check('a missing sessions service answers ok:true with nothing', [missingService.ok, missingService.sessions.length], [true, 0])
+check('and zeroed counts', missingService.counts, emptyAttentionCounts())
+checkThat('an unroutable clock still answers a number', typeof missingService.generatedAt === 'number')
+// A registry whose snapshot throws must not escape as a 500.
+const throwingRoutes = createRoutes(
+  { logger, get: ctx.get },
+  { allowedPaths: [repo], diagnostics: false },
+  { execFile: fileRedirectExecFile, on: () => () => {} },
+)
+throwingRoutes.attention.snapshot = () => {
+  throw new Error('snapshot exploded')
+}
+const survivedThrow = await (await throwingRoutes.handleAttention()).json()
+check('a throwing snapshot degrades to an empty answer', [survivedThrow.ok, survivedThrow.sessions.length, survivedThrow.counts], [
+  true,
+  0,
+  emptyAttentionCounts(),
+])
+
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

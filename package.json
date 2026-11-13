@@ -7,6 +7,7 @@
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./lib/attention": "./lib/attention.js",
     "./lib/git": "./lib/git.js",
     "./lib/p4": "./lib/p4.js",
     "./lib/vcs": "./lib/vcs.js"
@@ -14,6 +15,7 @@
   "files": [
     "index.js",
     "client.js",
+    "lib/attention.js",
     "lib/git.js",
     "lib/p4.js",
     "lib/vcs.js",
