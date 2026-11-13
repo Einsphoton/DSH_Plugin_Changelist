@@ -1513,12 +1513,20 @@ window.__ModuleLoader__.load({
      * `waiting`/`error` are kept: a blocked or failed session is still true
      * regardless of the clock.
      */
+    function isDelegatedChild(session) {
+      return (
+        session?.origin === 'subagent' ||
+        session?.parentSession !== undefined ||
+        (typeof session?.delegationDepth === 'number' && session.delegationDepth > 0)
+      )
+    }
+
     function pruneAttention(sessions) {
       const now = Date.now()
-      return sessions.filter(
-        (session) =>
-          !(session.state === 'done' && typeof session.at === 'number' && now - session.at > attentionTuning.doneTtlMs),
-      )
+      return sessions.filter((session) => {
+        if (isDelegatedChild(session)) return false
+        return !(session.state === 'done' && typeof session.at === 'number' && now - session.at > attentionTuning.doneTtlMs)
+      })
     }
 
     let attentionInFlight = null

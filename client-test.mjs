@@ -2168,6 +2168,38 @@ console.log('16i. work in progress is visible, not "all clear"')
   attentionPayload = null
 }
 
+console.log('16j. delegated children and blank rows never reach the panel')
+// The Host filters both, but a row that leaked through (older Host half, or a
+// record seeded before the filter existed) must not become an unopenable row in
+// the browser either. The wire now carries lineage so the client can refuse it.
+{
+  const guardInstance = attentionApply([])
+  const guardMod = guardInstance.mod
+  const guardPill = guardInstance.target.find((entry) => entry.id === 'changelist.attention.pill')
+  attentionPayload = {
+    ok: true,
+    schemaVersion: 1,
+    generatedAt: Date.now(),
+    sessions: [
+      // A real top-level session.
+      { sessionId: 'keep', title: '真实会话', dir: 'C:/w/K', workspace: 'K', state: 'running', reason: 'activity', turn: 1, since: Date.now(), at: Date.now(), running: true },
+      // A delegated child the Host should have dropped.
+      { sessionId: 'child', title: 'You are fixing a defect', dir: 'C:/w/K', workspace: 'K', state: 'running', reason: 'activity', turn: 1, since: Date.now(), at: Date.now(), running: true, origin: 'subagent', parentSession: 'keep', delegationDepth: 1 },
+      // A child identified only by its parent, with no explicit origin.
+      { sessionId: 'child2', title: 'You are researching', dir: 'C:/w/K', workspace: 'K', state: 'running', reason: 'activity', turn: 1, since: Date.now(), at: Date.now(), running: true, parentSession: 'keep' },
+    ],
+    counts: { waiting: 0, error: 0, done: 0, running: 3, idle: 0 },
+  }
+  await guardMod.attentionInternals.load({ t, silent: true })
+  const kept = guardMod.attentionInternals.store.get().sessions
+  check('delegated children are dropped by the client too', kept.map((session) => session.sessionId), ['keep'])
+  hookQueue.length = 0
+  const guardTree = expand(React.createElement(guardPill.component, { t, wide: true }))
+  checkThat('the pill counts only the real session', collectText(guardTree).includes('1'), collectText(guardTree))
+  check('and reports one running, not three', guardMod.attentionInternals.summary(guardMod.attentionInternals.store.get()).counts.running, 1)
+  attentionPayload = null
+}
+
 console.log('17. the attention surfaces carry their own styling contract')
 checkThat('the pill has a rail (collapsed) variant', pluginCss.includes('.dshAt_pill[data-rail=true]'), 'no rail rule')
 checkThat('the pill carries a caret for "needs you"', pluginCss.includes('.dshAt_caret{'), 'no caret rule')
