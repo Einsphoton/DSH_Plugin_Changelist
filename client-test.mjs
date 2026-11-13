@@ -1864,6 +1864,56 @@ console.log('16b2. Open follows the real open() contract')
   checkThat('and explains it in the panel itself, not a toast elsewhere', byClass(deadTree, 'dshAt_failBar').length === 1, collectClasses(deadTree))
   const failText = collectText(byClass(deadTree, 'dshAt_failBar')[0])
   checkThat('the explanation names the real reason', failText.includes('不在当前窗口的会话列表'), failText)
+
+  // When the session cannot be selected but its workspace can be entered, the
+  // click must still do something useful: adopt-or-create that directory's
+  // session the way the sidebar's "+ New session" does.
+  const adoptCalls = []
+  const adoptRegistered = []
+  const adoptMod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  adoptMod.apply({
+    effect(fn) {
+      void fn()
+    },
+    sessions: {
+      open() {
+        throw new Error('not selectable')
+      },
+      async refresh() {},
+      async create(opts) {
+        adoptCalls.push(opts)
+        return 'adopted-id'
+      },
+      list: { getSnapshot: () => ({ ids: ['other'], byId: { other: { id: 'other' } } }) },
+    },
+    locale: ctx.locale,
+    slots: {
+      inject(owner, register) {
+        void register()
+      },
+      register(options, component) {
+        adoptRegistered.push({ ...options, component })
+        return () => {}
+      },
+    },
+  })
+  adoptMod.attentionInternals.store.set({
+    open: true,
+    anchor: null,
+    sessions: [{ sessionId: 'sess-blocked', title: '被隔离的会话', dir: 'C:/w/Blocked', workspace: 'Blocked', state: 'waiting', reason: 'approval', turn: 1, since: 1, at: 1, running: true }],
+  })
+  const adoptPanel = adoptRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+  hookQueue.length = 0
+  byClass(expand(React.createElement(adoptPanel.component, { t })), 'dshAt_row')[0].props.onClick()
+  await settle()
+  check('an unselectable session falls back to opening its workspace', adoptCalls.map((opts) => opts.cwd), ['C:/w/Blocked'])
+  const adoptSnapshot = adoptMod.attentionInternals.store.get()
+  checkThat('and tells the reader what happened instead', String(adoptSnapshot.notice ?? '').includes('Blocked'), String(adoptSnapshot.notice))
+  check('and the panel gets out of the way', adoptSnapshot.open, false)
+  check('and no failure is reported', adoptSnapshot.failed, null)
   // A successful open clears the failure mark.
   attentionPayload = null
 }

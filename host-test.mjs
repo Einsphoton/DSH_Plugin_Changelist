@@ -994,6 +994,40 @@ check('the disabled route is still mounted', disabledRegistered.length, 4)
   )
 }
 
+// 9b3. Subagent children are not sessions the reader can act on.
+// A delegated child inherits its parent's cwd, so without a lineage filter every
+// "You are researching ..." / "You are fixing a defect" child appeared as its own
+// row, and none of them can be selected in the client — the exact "打开 does
+// nothing" report. Only top-level sessions belong in this answer.
+{
+  const subNow = 1_700_000_000_000
+  const child = (id, parent) => ({
+    id,
+    header: { cwd: 'K:/w/Parent', origin: 'subagent', parentSession: parent, delegationDepth: 1 },
+    ownEvents: () => [{ type: 'turn/start', turn: 1, time: subNow - 1_000 }],
+  })
+  const liveNow = [
+    { id: 'top-1', header: { cwd: 'K:/w/Parent' }, ownEvents: () => [{ type: 'turn/start', turn: 2, time: subNow - 500 }] },
+    child('child-a', 'top-1'),
+    child('child-b', 'top-1'),
+  ]
+  const seededStore = { list: () => liveNow.slice(), get: (id) => liveNow.find((session) => session.id === id) }
+  const subRoutes = createRoutes(
+    { logger, get: () => undefined },
+    { diagnostics: false },
+    { execFile: fileRedirectExecFile, on: () => () => {}, now: () => subNow, attentionSessions: seededStore },
+  )
+  const subBody = await (await subRoutes.handleAttention(new Request(`http://localhost${ROUTES.attention}`))).json()
+  check('only the top-level session is reported', subBody.sessions.map((session) => session.sessionId), ['top-1'])
+  check('and the delegated children do not inflate the counts', subBody.counts, {
+    waiting: 0,
+    error: 0,
+    done: 0,
+    running: 1,
+    idle: 0,
+  })
+}
+
 // 9c. a broken subsystem still answers ok:true.
 const brokenAttentionRoutes = createRoutes(
   { logger, get: () => undefined },

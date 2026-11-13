@@ -154,6 +154,7 @@ window.__ModuleLoader__.load({
       attentionOpen: '打开',
       attentionNotInList: '不在列表',
       attentionNotOpenableHint: '这个会话不在当前窗口的会话列表里（{id}），无法直接打开。它可能已归档，或只属于另一个窗口。',
+      attentionOpenedWorkspace: '已切到「{workspace}」：这个会话不能直接打开，请在该工作区的会话列表里选择',
       attentionOpenFailed: '打不开这个会话（{id}）：它不在当前窗口的会话列表里，刷新后仍找不到',
       attentionOpenFailedShort: '打不开',
       attentionMarkAllRead: '全部标记已读',
@@ -297,6 +298,7 @@ window.__ModuleLoader__.load({
       attentionOpen: 'Open',
       attentionNotInList: 'not listed',
       attentionNotOpenableHint: 'This session is not in this window’s session list ({id}), so it cannot be opened directly. It may be archived, or belong to another window.',
+      attentionOpenedWorkspace: 'Switched to “{workspace}”: that session cannot be opened directly, pick it from the workspace’s session list',
       attentionOpenFailed: 'Cannot open that session ({id}): it is not in this window’s session list, even after a refresh',
       attentionOpenFailedShort: 'Cannot open',
       attentionMarkAllRead: 'Mark all read',
@@ -437,6 +439,7 @@ window.__ModuleLoader__.load({
       '.dshAt_emptyWarn{color:var(--dsw-alias-state-warn-primary,#bf8700);text-align:left;white-space:pre-wrap}',
       '.dshAt_staleHead{padding:6px 10px 2px;color:var(--dsw-alias-label-tertiary);font-size:11px}',
       '.dshAt_failBar{flex:none;padding:7px 12px;border-top:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-state-error-primary,#e03131);font-size:11px;line-height:1.45}',
+      '.dshAt_noticeBar{flex:none;padding:7px 12px;border-top:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-state-warn-primary,#bf8700);font-size:11px;line-height:1.45}',
       '.dshAt_text{min-width:0;overflow:hidden;text-overflow:ellipsis;font-family:var(--ds-font-family-code)}',
       '.dshAt_pill[data-state=waiting] .dshAt_text{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
       '.dshAt_pill[data-state=error] .dshAt_text{color:var(--dsw-alias-state-error-primary,#e03131)}',
@@ -973,19 +976,30 @@ window.__ModuleLoader__.load({
     async function loadState(options = {}) {
       const snapshot = store.get()
       const query = targetQuery(snapshot)
-      if (!query) return
+      if (!query) return null
+      // An automatic read (driven by the revision poll) must be invisible: it
+      // never turns the list into skeleton rows, never clears a notice and never
+      // claims the toolbar, so a background refresh cannot make the panel jump.
+      // It still merges with an in-flight read and still honours `generation`.
+      const auto = options.auto === true
       const inFlightKey = `${targetKey(snapshot.target)}\u0000${snapshot.vcs}\u0000${options.fetchRemote ? 'fetch' : 'read'}`
       // A read may only be shared while it is still the current generation: a
       // target switch bumped it, and the old promise will discard its own answer.
       if (!options.force && stateInFlight?.key === inFlightKey && stateInFlight.token === generation) {
         return stateInFlight.promise
       }
+      // A background read must never displace a read the reader asked for (a
+      // refresh, a fetch, a target switch): it would bump `generation` and throw
+      // that answer away. Skipping one tick costs nothing — the next poll picks
+      // the change up again because the rev is only marked applied once read.
+      if (auto && stateInFlight) return null
       const token = ++generation
       // A state read replaces the list, so any comparison still in flight would
       // be answering about a list that no longer exists.
       diffGeneration++
-      store.set({ busy: true })
+      if (!auto) store.set({ busy: true })
       let loaded = false
+      let result = null
       const promise = (async () => {
         try {
           const extra = {
@@ -1007,36 +1021,51 @@ window.__ModuleLoader__.load({
             phase: body.ok === false ? 'error' : files.length === 0 ? 'clean' : 'ready',
             selected,
             hostCompat: viaDirectory ? 'dir' : 'session',
-            // A fetch result belongs to this answer only; keeping an older
-            // notice is how "Fetched origin" used to stay on screen forever.
-            notice: body.fetch
-              ? body.fetch.ok
-                ? options.t?.('fetchOk', { remote: body.fetch.remote }) ?? null
-                : options.t?.('fetchFailed', { remote: body.fetch.remote, message: body.fetch.message ?? '' }) ?? null
-              : null,
+            // A background read leaves the notice alone: "已拉取 origin" is the
+            // reader's news about a click they made, not a property of this file
+            // list, and a silent refresh must never wipe it.
+            ...(auto
+              ? {}
+              : {
+                  // A fetch result belongs to this answer only; keeping an older
+                  // notice is how "Fetched origin" used to stay on screen forever.
+                  notice: body.fetch
+                    ? body.fetch.ok
+                      ? options.t?.('fetchOk', { remote: body.fetch.remote }) ?? null
+                      : options.t?.('fetchFailed', { remote: body.fetch.remote, message: body.fetch.message ?? '' }) ?? null
+                    : null,
+                }),
             // Auto-detected per project: a Perforce workspace that cannot be
             // reached asks for its connection; anything else closes a panel the
             // plugin itself opened.
             ...(connectionPromptPatch(body, store.get()) ?? {}),
           })
           loaded = true
+          result = body
         } catch (cause) {
           if (token !== generation) return
-          store.set({
-            phase: 'error',
-            error:
-              cause.status === 403 && cause.body?.allowed
-                ? `${cause.message}\n${cause.body.allowed.join('  ')}`
-                : cause.message,
-          })
+          // A silent refresh has no surface to report on: the previous list is
+          // still the best thing the panel knows, and an error banner over a
+          // background poll would be a regression, not information.
+          if (!auto) {
+            store.set({
+              phase: 'error',
+              error:
+                cause.status === 403 && cause.body?.allowed
+                  ? `${cause.message}\n${cause.body.allowed.join('  ')}`
+                  : cause.message,
+            })
+          }
         } finally {
           if (stateInFlight?.token === token) stateInFlight = null
-          if (token === generation) store.set({ busy: false })
+          // Only a foreground read owns the toolbar; an auto read never took it.
+          if (!auto && token === generation) store.set({ busy: false })
         }
         // The refresh may have re-picked the selected file (first file of the new
         // list), so the comparison has to follow it. Without this the pane kept
         // the previous file's text while its header showed the new path.
         if (loaded && token === generation) await loadDiff(options.t)
+        return result
       })()
       stateInFlight = { key: inFlightKey, token, promise }
       return promise
@@ -1354,6 +1383,8 @@ window.__ModuleLoader__.load({
         failed: null,
         /** Why that open failed, shown in the panel's own footer. */
         failedMessage: null,
+        /** A short-lived line for an action that succeeded indirectly. */
+        notice: null,
       },
       listeners: new Set(),
       get() {
@@ -1761,8 +1792,31 @@ window.__ModuleLoader__.load({
         succeed()
         return
       }
-      // Still unselectable. Keep the panel OPEN so the reader can see why: closing
-      // it on failure would hide the only explanation of what went wrong.
+      // Still unselectable. There is one honest recovery left: the session is
+      // real but not addressable in this window, and opening its WORKSPACE is
+      // something the client can always do — `sessions.create({ cwd })` is the
+      // same adopt-or-create the sidebar's "+ New session" uses. The reader
+      // lands in the right project and can pick the conversation from the tree.
+      const session = (attention.get().sessions ?? []).find((entry) => entry.sessionId === sessionId)
+      if (session?.dir && typeof service?.create === 'function') {
+        try {
+          const adopted = await service.create({ cwd: session.dir })
+          if (typeof adopted === 'string') {
+            attempt()
+            attention.set({
+              failed: null,
+              failedMessage: null,
+              open: false,
+              notice: tr('attentionOpenedWorkspace', { workspace: session.workspace || session.dir }),
+            })
+            return
+          }
+        } catch {
+          /* fall through to the plain explanation */
+        }
+      }
+      // Nothing worked. Keep the panel OPEN so the reader can see why: closing it
+      // would hide the only explanation of what went wrong.
       attention.set({
         failed: sessionId,
         failedMessage: selectableSessionIds(service)?.has(sessionId)
@@ -2613,6 +2667,9 @@ window.__ModuleLoader__.load({
         // failure takes the slot and the permission line moves to its tooltip.
         snapshot.failedMessage
           ? h('div', { className: 'dshAt_failBar', role: 'status' }, snapshot.failedMessage)
+          : null,
+        snapshot.notice
+          ? h('div', { className: 'dshAt_noticeBar', role: 'status' }, snapshot.notice)
           : null,
         h(
           'div',
