@@ -1717,6 +1717,122 @@ check('opening a row opens that session', attentionSessions, ['sess-wait'])
 const reopened = expand(React.createElement(panelEntry.component, { t }))
 check('a waiting row stays loud after being opened', byClass(reopened, 'dshAt_row')[0]?.props.className, 'dshAt_row')
 
+console.log('16b2. Open follows the real open() contract')
+// `ctx.sessions.open(id)` is strict: the id must exist in THIS window's list and
+// an unknown one fails loud. The guide lists every session the HOST knows about,
+// so the first attempt legitimately throws for a session this window never
+// loaded. The guide must refresh and retry — and must never look like it worked
+// when it did not.
+{
+  const openCalls = []
+  const refreshCalls = []
+  // A service whose list only contains the session AFTER a refresh, exactly like
+  // a session opened in another window since this tab loaded.
+  let known = false
+  const strictRegistered = []
+  const strictMod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  strictMod.apply({
+    effect(fn) {
+      void fn()
+    },
+    sessions: {
+      open(id) {
+        if (!known) throw new Error(`session ${id} is not in the list`)
+        openCalls.push(id)
+      },
+      async refresh() {
+        refreshCalls.push(true)
+        known = true
+      },
+      list: { getSnapshot: () => ({ byId: {} }) },
+    },
+    locale: ctx.locale,
+    slots: {
+      inject(owner, register) {
+        void register()
+      },
+      register(options, component) {
+        strictRegistered.push({ ...options, component })
+        return () => {}
+      },
+    },
+  })
+  const strictPanel = strictRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+  attentionPayload = {
+    ok: true,
+    schemaVersion: 1,
+    generatedAt: Date.now(),
+    sessions: [
+      { sessionId: 'sess-remote', title: '远程会话', dir: 'C:/work/Remote', workspace: 'Remote', state: 'done', reason: 'turn-end', turn: 1, since: Date.now(), at: Date.now(), running: false },
+    ],
+    counts: { waiting: 0, error: 0, done: 1, running: 0, idle: 0 },
+  }
+  // Load through THIS module's own seam; it has its own store, so the shared
+  // `internals` (which belongs to `mod`) would not reach it.
+  await strictMod.attentionInternals.load({ t, silent: true })
+  strictMod.attentionInternals.store.set({ open: true, anchor: null })
+  hookQueue.length = 0
+  const strictTree = expand(React.createElement(strictPanel.component, { t }))
+  const row = byClass(strictTree, 'dshAt_row')[0]
+  checkThat('the panel renders the remote session', row !== undefined, collectText(strictTree).slice(0, 200))
+  row.props.onClick()
+  await settle()
+  check('an unknown session triggers one list refresh', refreshCalls.length, 1)
+  check('and the retry opens it', openCalls, ['sess-remote'])
+
+  // Now the genuinely unopenable case: refresh does not help, so the row must
+  // say so rather than silently doing nothing.
+  const deadCalls = []
+  const deadRegistered = []
+  const deadMod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  deadMod.apply({
+    effect(fn) {
+      void fn()
+    },
+    sessions: {
+      open(id) {
+        deadCalls.push(id)
+        throw new Error('nope')
+      },
+      async refresh() {},
+      list: { getSnapshot: () => ({ byId: {} }) },
+    },
+    locale: ctx.locale,
+    slots: {
+      inject(owner, register) {
+        void register()
+      },
+      register(options, component) {
+        deadRegistered.push({ ...options, component })
+        return () => {}
+      },
+    },
+  })
+  deadMod.attentionInternals.store.set({
+    open: true,
+    anchor: null,
+    sessions: [{ sessionId: 'sess-dead', title: '死会话', dir: 'C:/w/D', workspace: 'D', state: 'done', reason: 'turn-end', turn: 1, since: 1, at: 1, running: false }],
+  })
+  const deadPanel = deadRegistered.find((entry) => entry.id === 'changelist.attention.panel')
+  hookQueue.length = 0
+  byClass(expand(React.createElement(deadPanel.component, { t })), 'dshAt_row')[0].props.onClick()
+  await settle()
+  check('an unopenable session is retried exactly twice', deadCalls.length, 2)
+  hookQueue.length = 0
+  const deadTree = expand(React.createElement(deadPanel.component, { t }))
+  check('the row marks the failed open', byClass(deadTree, 'dshAt_row')[0]?.props['data-failed'], 'true')
+  checkThat('and says it could not open', collectText(deadTree).includes('打不开'), collectText(deadTree).slice(0, 300))
+  checkThat('and explains it in the panel itself, not a toast elsewhere', byClass(deadTree, 'dshAt_failBar').length === 1, collectClasses(deadTree))
+  // A successful open clears the failure mark.
+  attentionPayload = null
+}
+
 console.log('16c. OS notifications respect permission and quiet hours')
 // The mount read is deliberately silent (a page reload must never re-notify for
 // old news), so a transition is produced the way production produces one: a

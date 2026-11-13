@@ -151,6 +151,8 @@ window.__ModuleLoader__.load({
       attentionUnknownBody:
         '读不到会话状态，所以这里既不能说「全部正常」，也不能说「有事」。\n最常见的原因是运行中的 Host 半边还是旧版：本 profile 的 HMR 不监听源码，改完插件要在 Plugins 页面把该 bundle 关掉再打开（或重启 DSH），新的 /api/changelist.attention 路由才会注册。',
       attentionOpen: '打开',
+      attentionOpenFailed: '打不开这个会话（{id}）：它不在当前窗口的会话列表里，刷新后仍找不到',
+      attentionOpenFailedShort: '打不开',
       attentionMarkAllRead: '全部标记已读',
       attentionUnknownWorkspace: '未知工作区',
       attentionAgoJustNow: '刚刚',
@@ -287,6 +289,8 @@ window.__ModuleLoader__.load({
       attentionUnknownBody:
         'Session status cannot be read, so this cannot honestly say "all clear" or "something needs you".\nThe usual cause is a running Host half from before this feature: HMR does not watch sources in this profile, so toggle the bundle off and on in the Plugins page (or restart DSH) to register the new /api/changelist.attention route.',
       attentionOpen: 'Open',
+      attentionOpenFailed: 'Cannot open that session ({id}): it is not in this window’s session list, even after a refresh',
+      attentionOpenFailedShort: 'Cannot open',
       attentionMarkAllRead: 'Mark all read',
       attentionUnknownWorkspace: 'Unknown workspace',
       attentionAgoJustNow: 'just now',
@@ -422,6 +426,7 @@ window.__ModuleLoader__.load({
       '.dshAt_pill[data-state=unknown] .dshAt_text{color:var(--dsw-alias-label-tertiary)}',
       '.dshAt_emptyWarn{color:var(--dsw-alias-state-warn-primary,#bf8700);text-align:left;white-space:pre-wrap}',
       '.dshAt_staleHead{padding:6px 10px 2px;color:var(--dsw-alias-label-tertiary);font-size:11px}',
+      '.dshAt_failBar{flex:none;padding:7px 12px;border-top:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-state-error-primary,#e03131);font-size:11px;line-height:1.45}',
       '.dshAt_text{min-width:0;overflow:hidden;text-overflow:ellipsis;font-family:var(--ds-font-family-code)}',
       '.dshAt_pill[data-state=waiting] .dshAt_text{color:var(--dsw-alias-state-warn-primary,#bf8700)}',
       '.dshAt_pill[data-state=error] .dshAt_text{color:var(--dsw-alias-state-error-primary,#e03131)}',
@@ -454,6 +459,9 @@ window.__ModuleLoader__.load({
       '.dshAt_rowDot{flex:none;color:var(--dsw-alias-label-tertiary)}',
       '.dshAt_openHint{flex:none;color:var(--dsw-alias-label-tertiary);font-size:11px}',
       '.dshAt_row:hover .dshAt_openHint{color:var(--dsw-alias-label-primary)}',
+      /* A row whose Open did nothing must not look like a successful click. */
+      '.dshAt_row[data-failed=true]{box-shadow:inset 2px 0 0 var(--dsw-alias-state-error-primary,#e03131)}',
+      '.dshAt_row[data-failed=true] .dshAt_openHint{color:var(--dsw-alias-state-error-primary,#e03131)}',
       '.dshAt_empty{padding:20px 14px;color:var(--dsw-alias-label-tertiary);font-size:12px;line-height:1.6;text-align:center}',
       '.dshAt_foot{flex:none;display:flex;align-items:center;gap:8px;padding:8px 12px;border-top:.5px solid var(--dsw-alias-border-l3);color:var(--dsw-alias-label-tertiary);font-size:11px}',
       '.dshAt_footText{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
@@ -1307,6 +1315,10 @@ window.__ModuleLoader__.load({
         waitingKey: '',
         /** Permission state for L1: 'default' | 'granted' | 'denied' | 'unsupported'. */
         permission: 'unsupported',
+        /** Session id whose last "Open" failed, so the row can say so. */
+        failed: null,
+        /** Why that open failed, shown in the panel's own footer. */
+        failedMessage: null,
       },
       listeners: new Set(),
       get() {
@@ -1625,7 +1637,7 @@ window.__ModuleLoader__.load({
               /* some platforms refuse focus from a notification */
             }
             attention.set({ open: true })
-            openSession(session.sessionId)
+            void openSession(session.sessionId, t)
             notification.close?.()
           }
         } else {
@@ -1665,20 +1677,65 @@ window.__ModuleLoader__.load({
       }
     }
 
-    /** Open one session from the guide, and remember that it was acknowledged. */
-    function openSession(sessionId) {
-      try {
-        sessionsService?.open?.(sessionId)
-      } catch {
-        /* an unopenable row must not break the panel */
+    /**
+     * Open one session from the guide.
+     *
+     * `ctx.sessions.open(id)` is strict by contract: the id must already exist in
+     * THIS window's list, and an unknown id fails loud. The guide, however, lists
+     * every session the HOST knows about — including ones this window has never
+     * had in its list (opened in another window, or created after this tab
+     * loaded). So an open is: try, refresh the list once, try again, and if it
+     * still fails say so instead of swallowing it. Silently doing nothing is how
+     * this button looked broken.
+     */
+    async function openSession(sessionId, translate = null) {
+      const tr = typeof translate === 'function' ? translate : fallbackTranslator
+      const service = sessionsService
+      const attempt = () => {
+        try {
+          service?.open?.(sessionId)
+          return true
+        } catch {
+          return false
+        }
       }
+      if (attempt()) {
+        markAttentionOpened(sessionId)
+        return
+      }
+      // The list this window holds is stale or simply never had this session:
+      // pull the Host's list, then retry once.
+      try {
+        if (typeof service?.refresh === 'function') await service.refresh()
+      } catch {
+        /* a failed refresh is just another failed open, reported below */
+      }
+      if (attempt()) {
+        markAttentionOpened(sessionId)
+        return
+      }
+      // Not openable here. Never pretend the click worked: mark the row and say
+      // it inline. `flashNotice` belongs to the changelist store, whose surfaces
+      // are not necessarily on screen — the guide has to report its own failure.
+      attention.set({ failed: sessionId, failedMessage: tr('attentionOpenFailed', { id: sessionId }) })
+      if (typeof setTimeout === 'function') {
+        setTimeout(() => {
+          if (attention.get().failed === sessionId) attention.set({ failed: null, failedMessage: null })
+        }, 6000)
+      }
+    }
+
+    /** Record that the reader has seen one entry (never for `waiting`). */
+    function markAttentionOpened(sessionId) {
       const snapshot = attention.get()
       const session = (snapshot.sessions ?? []).find((entry) => entry.sessionId === sessionId)
       // `waiting` is never cleared by opening: the agent is still blocked until
       // the reader actually answers it inside that session.
       if (session && session.state !== 'waiting') {
-        attention.set({ read: { ...snapshot.read, [sessionId]: true } })
+        attention.set({ read: { ...snapshot.read, [sessionId]: true }, failed: null, failedMessage: null })
         applyTitle(attentionSummary(attention.get()))
+      } else {
+        attention.set({ failed: null, failedMessage: null })
       }
     }
 
@@ -2435,8 +2492,9 @@ window.__ModuleLoader__.load({
                         type: 'button',
                         key: session.sessionId,
                         className: `dshAt_row${read[session.sessionId] ? ' dshAt_rowRead' : ''}`,
+                        'data-failed': snapshot.failed === session.sessionId ? 'true' : undefined,
                         title: `${session.title ?? ''}${session.dir ? `\n${session.dir}` : ''}`,
-                        onClick: () => openSession(session.sessionId),
+                        onClick: () => void openSession(session.sessionId, t),
                       },
                       h('span', { className: 'dshAt_stateIcon', 'data-state': session.state, 'aria-hidden': 'true' }, ATTENTION_ICON[session.state] ?? '·'),
                       h(
@@ -2451,7 +2509,7 @@ window.__ModuleLoader__.load({
                           h('span', null, attentionAgo(session.at, t)),
                         ),
                       ),
-                      h('span', { className: 'dshAt_openHint' }, t('attentionOpen')),
+                      h('span', { className: 'dshAt_openHint' }, snapshot.failed === session.sessionId ? t('attentionOpenFailedShort') : t('attentionOpen')),
                     ),
                   ),
                 ),
@@ -2474,6 +2532,12 @@ window.__ModuleLoader__.load({
                 ? h('span', { className: 'dshAt_legendItem' }, h('span', { className: 'dshAt_dot', 'data-state': 'running' }), t('stateRunning'))
                 : null,
             )
+          : null,
+        // An open that failed is reported right here, in the surface the reader
+        // is looking at; the footer already carries the permission state, so the
+        // failure takes the slot and the permission line moves to its tooltip.
+        snapshot.failedMessage
+          ? h('div', { className: 'dshAt_failBar', role: 'status' }, snapshot.failedMessage)
           : null,
         h(
           'div',
