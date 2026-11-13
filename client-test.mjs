@@ -1675,9 +1675,9 @@ function attentionApply(target) {
       },
     },
   })
-  return target
+  return { target, mod }
 }
-attentionApply(attentionRegistered)
+const attentionInstance = attentionApply(attentionRegistered)
 const pillEntry = attentionRegistered.find((entry) => entry.id === 'changelist.attention.pill')
 const panelEntry = attentionRegistered.find((entry) => entry.id === 'changelist.attention.panel')
 checkThat('the pill registers into the sidebar foot', pillEntry?.name === 'sidebar.footer.action', JSON.stringify(attentionRegistered.map((e) => e.name)))
@@ -1713,7 +1713,14 @@ const rowsText = byClass(panelTree, 'dshAt_row').map((node) => collectText(node)
 checkThat('the reason is spelled out per row', rowsText.includes('waiting-session') && rowsText.includes('finished-session'), rowsText)
 byClass(panelTree, 'dshAt_row')[0].props.onClick()
 check('opening a row opens that session', attentionSessions, ['sess-wait'])
-// `waiting` is sticky: opening the row must not silence a still-blocked agent.
+// Opening must also get the panel out of the way: the session switches behind
+// it, so leaving it up looks like the click did nothing.
+const afterOpen = expand(React.createElement(panelEntry.component, { t }))
+checkThat('and closes the guide so the session is visible', afterOpen === null, String(afterOpen?.props?.className))
+// `waiting` is sticky: reopening the guide still shows the still-blocked agent.
+// Reopen through the same module instance the panel came from.
+attentionInstance.mod.attentionInternals.store.set({ open: true })
+hookQueue.length = 0
 const reopened = expand(React.createElement(panelEntry.component, { t }))
 check('a waiting row stays loud after being opened', byClass(reopened, 'dshAt_row')[0]?.props.className, 'dshAt_row')
 
@@ -1862,7 +1869,7 @@ checkThat('the notification carries a dedupe tag', sentNotifications.every((entr
 // Permission denied: nothing is sent, but the surfaces still paint.
 notificationState.permission = 'denied'
 FakeNotification.permission = 'denied'
-const deniedRegistered = attentionApply([])
+const deniedRegistered = attentionApply([]).target
 const deniedPill = deniedRegistered.find((entry) => entry.id === 'changelist.attention.pill')
 const deniedPanel = deniedRegistered.find((entry) => entry.id === 'changelist.attention.panel')
 sentNotifications.length = 0
@@ -2050,6 +2057,38 @@ attentionPayload = realPayload
 await settle()
 await internals.load({ t, silent: true })
 check('a successful read is reachable again', internals.store.get().reachable, true)
+
+console.log('16i. work in progress is visible, not "all clear"')
+// A workspace with agents mid-turn used to read "全部正常", because the pill only
+// escalated for states that need a human. Knowing that work is happening is
+// itself the answer to "is anything going on in my other projects?".
+{
+  const busyInstance = attentionApply([])
+  const busyRegistered = busyInstance.target
+  const busyMod = busyInstance.mod
+  const busyPill = busyRegistered.find((entry) => entry.id === 'changelist.attention.pill')
+  attentionPayload = {
+    ok: true,
+    schemaVersion: 1,
+    generatedAt: Date.now(),
+    sessions: [
+      { sessionId: 's-a', title: '甲', dir: 'C:/w/A', workspace: 'A', state: 'running', reason: 'activity', turn: 1, since: Date.now(), at: Date.now(), running: true },
+      { sessionId: 's-b', title: '乙', dir: 'C:/w/B', workspace: 'B', state: 'running', reason: 'turn-start', turn: 1, since: Date.now(), at: Date.now(), running: true },
+    ],
+    counts: { waiting: 0, error: 0, done: 0, running: 2, idle: 0 },
+  }
+  busyMod.attentionInternals.store.set({ sessions: [], read: {}, enabled: true, reachable: true })
+  await busyMod.attentionInternals.load({ t, silent: true })
+  hookQueue.length = 0
+  const busyTree = expand(React.createElement(busyPill.component, { t, wide: true }))
+  check('the pill is not "all clear" while two sessions run', byClass(busyTree, 'dshAt_pill')[0]?.props['data-state'], 'running')
+  checkThat('and it says how many are working', collectText(busyTree).includes('进行中'), collectText(busyTree))
+  checkThat('and does not claim everything is normal', !collectText(busyTree).includes('全部正常'), collectText(busyTree))
+  // It must still be below the states that need a human.
+  const summary = busyMod.attentionInternals.summary(busyMod.attentionInternals.store.get())
+  check('running ranks below waiting/error/done', [summary.worst, summary.counts.running], ['running', 2])
+  attentionPayload = null
+}
 
 console.log('17. the attention surfaces carry their own styling contract')
 checkThat('the pill has a rail (collapsed) variant', pluginCss.includes('.dshAt_pill[data-rail=true]'), 'no rail rule')

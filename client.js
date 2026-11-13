@@ -138,6 +138,7 @@ window.__ModuleLoader__.load({
       attentionPillWaiting: '{count} 待处理',
       attentionPillError: '{count} 出错',
       attentionPillDone: '{count} 已完成',
+      attentionPillRunning: '{count} 进行中',
       attentionCalloutWaiting: '工作区里有 {count} 个会话在等你',
       attentionCalloutError: '{count} 个会话本轮出错了',
       attentionEnableNotifications: '打开系统通知',
@@ -169,6 +170,8 @@ window.__ModuleLoader__.load({
       reasonBlocked: '等待恢复',
       reasonTurnError: '本轮出错',
       reasonTurnEnd: '本轮完成',
+      reasonTurnStart: '正在开始新一轮',
+      reasonActivity: '正在执行',
       reasonUnknown: '状态变化',
       notifyWaitingTitle: '「{workspace}」等你确认',
       notifyErrorTitle: '「{workspace}」本轮出错',
@@ -276,6 +279,7 @@ window.__ModuleLoader__.load({
       attentionPillWaiting: '{count} need you',
       attentionPillError: '{count} failed',
       attentionPillDone: '{count} finished',
+      attentionPillRunning: '{count} running',
       attentionCalloutWaiting: '{count} session(s) are waiting for you',
       attentionCalloutError: '{count} session(s) ended with an error',
       attentionEnableNotifications: 'Enable system notifications',
@@ -307,6 +311,8 @@ window.__ModuleLoader__.load({
       reasonBlocked: 'Blocked',
       reasonTurnError: 'Turn failed',
       reasonTurnEnd: 'Turn finished',
+      reasonTurnStart: 'Starting a turn',
+      reasonActivity: 'Working',
       reasonUnknown: 'State changed',
       notifyWaitingTitle: '“{workspace}” needs you',
       notifyErrorTitle: '“{workspace}” hit an error',
@@ -1286,6 +1292,8 @@ window.__ModuleLoader__.load({
       blocked: 'reasonBlocked',
       'turn-error': 'reasonTurnError',
       'turn-end': 'reasonTurnEnd',
+      'turn-start': 'reasonTurnStart',
+      activity: 'reasonActivity',
     }
 
     // A third store: attention is independent of the changelist target and must
@@ -1412,11 +1420,14 @@ window.__ModuleLoader__.load({
         counts[state] += 1
         if (state !== 'running' && state !== 'idle' && !read[session.sessionId]) unread += 1
       }
-      // What the pill is coloured by: the worst state that still needs a human.
+      // What the pill is coloured by. `running` counts: "three projects are
+      // working" is exactly the fact this surface exists to report, and leaving
+      // it out made a busy workspace read "全部正常".
       let worst = null
       if (sessions.some((session) => session.state === 'waiting')) worst = 'waiting'
       else if (sessions.some((session) => session.state === 'error' && !read[session.sessionId])) worst = 'error'
       else if (sessions.some((session) => session.state === 'done' && !read[session.sessionId])) worst = 'done'
+      else if (sessions.some((session) => session.state === 'running')) worst = 'running'
       return { counts, unread, worst, total: sessions.length }
     }
 
@@ -1692,15 +1703,25 @@ window.__ModuleLoader__.load({
       const tr = typeof translate === 'function' ? translate : fallbackTranslator
       const service = sessionsService
       const attempt = () => {
+        // No service is not a success: `?.()` would silently do nothing and
+        // report that the session opened when nothing happened at all.
+        if (typeof service?.open !== 'function') return false
         try {
-          service?.open?.(sessionId)
+          service.open(sessionId)
           return true
         } catch {
           return false
         }
       }
-      if (attempt()) {
+      // Opening is only useful if the reader can SEE the session: the guide is a
+      // floating panel, so it has to get out of the way. Closing first also means
+      // a failed open cannot leave a panel covering the reason it failed.
+      const succeed = () => {
+        attention.set({ open: false })
         markAttentionOpened(sessionId)
+      }
+      if (attempt()) {
+        succeed()
         return
       }
       // The list this window holds is stale or simply never had this session:
@@ -1711,7 +1732,7 @@ window.__ModuleLoader__.load({
         /* a failed refresh is just another failed open, reported below */
       }
       if (attempt()) {
-        markAttentionOpened(sessionId)
+        succeed()
         return
       }
       // Not openable here. Never pretend the click worked: mark the row and say
@@ -2350,7 +2371,9 @@ window.__ModuleLoader__.load({
               ? t('attentionPillError', { count: summary.counts.error })
               : worst === 'done'
                 ? t('attentionPillDone', { count: summary.unread })
-                : t('attentionPillClear')
+                : worst === 'running'
+                  ? t('attentionPillRunning', { count: summary.counts.running })
+                  : t('attentionPillClear')
 
       // The call-out is the "pointer": it says out loud that something above in
       // this list needs a click, and collapses once the reader has seen it.
