@@ -9,6 +9,7 @@
 - **会话头部胶囊（常驻）**：会话标题栏右上角的小胶囊，带状态点与 `N 个文件 +增 −删`。
   - 状态点：有改动 = 琥珀色，工作区干净 = 绿色，出错 = 红色，加载中 = 灰色，**非 git / 非 Perforce 目录 = 中性灰**（是事实，不是故障）；hover 显示 `分支 → 基准 · +增 −删`（Perforce 目标显示客户端名与 rev）。
   - 点击开/关浮窗，并顺手刷新一次状态。
+  - **自己会更新**：Agent 改完文件后胶囊与浮窗在一两秒内跟上，不用点「刷新」（见「自动刷新」）。
 - **浮动摘要（点击展开）**：挂在 `shell.overlay` 层的小卡片，不挤压布局。
   - 头部：`分支 → 基准`、`↑领先 ↓落后`、`+增/−删`，以及 **后端切换器（`自动 / git / Perforce`）/ 连接 / 刷新 / 拉取远端 / 自动换行 / 关闭**。
   - 胶囊与头部都用一个小徽标（`git` / `P4`）说明这次是哪个后端回答的。
@@ -121,6 +122,18 @@ Perforce 侧与 git 侧一样**只读**：只跑 `info` / `opened` / `fstat` / `
 - **会话目录就是客户端根目录时不扫描本地改动**：此时勾选「扫描本地未 opened 改动」只会得到一条说明（整工作区扫描可能耗时数分钟），不会真的去扫。要看本地未 opened 改动，请在客户端根目录的子目录里开会话，或把 `p4LocalEdits` 关掉只用 `opened`。
 - **`default` changelist** 按 `default` 展示，与编号变更列表并列。
 - **检测缓存**：目录探测结果缓存 60 秒；刚把目录变成 Perforce 客户端根目录后，最多等 60 秒（或重启应用）才会改变识别结果。
+- **自动刷新感知不到「外部」改动**：平台没有 OS 文件监听，`fs/observed` 只覆盖 Agent 工具自己的文件操作。所以：
+
+  | 改动来源 | 会自动刷新？ |
+  |---|---|
+  | Agent 用 `write`/`edit` 等 fs 工具改文件 | ✅ 精确信号（版本变化） |
+  | Agent 用 `pwsh`/`bash`/脚本改文件 | ✅ `tool/result` 粗信号 |
+  | 一轮对话结束 | ✅ `turn/end` 兜底 |
+  | **你在编辑器里手改、IDE 保存** | ⚠️ 不会自行 bump；**切回窗口时补一次 `state` 读取**（浮窗开着时立即读，否则下一次可见性检查） |
+  | **`git checkout`/切分支/pull/`p4 sync`** | ⚠️ 同上，靠回到窗口的补偿 |
+  | Agent 只读不写 | ❌ 不该刷（`turn/end` 仍会刷一次） |
+
+  换句话说：面板对 Agent 的改动是**实时**的，对你手工改动是**回到窗口时**的。
 
 ## 安装
 
@@ -203,6 +216,8 @@ index.js 最后修改 2026-10-16 13:58  ← 比它新
 | `p4ScanTimeoutMs` | `120000` | 本地未 opened 改动扫描的超时上限 |
 | `p4Shelved` | `true` | 是否包含 shelved 变更列表 |
 | `allowedPaths` | `[]` | 目录白名单之外的额外目录 |
+| `watchEnabled` | `true` | 是否发布 `/api/changelist.revision`（自动刷新的变更检测）。`false` 时路由照常应答 `{ok:true, enabled:false, rev:0}` 且不订阅任何事件，浏览器会静默退回手动刷新 |
+| `watchDiagnostics` | `false` | 是否把每次 `revision` 轮询写进活动日志。**默认关**：2 秒一次的轮询会把 `host.log` 变成噪声，埋掉它本该解释的那些 `state` 读取 |
 | `diagnostics` | `true` | 是否写活动日志（见下） |
 | `diagnosticsPath` | `null` | 覆盖日志路径；`null` = `<插件目录>/.diagnostics/host.log` |
 | `diagnosticsMaxBytes` | `262144` | 超过则只保留最后 200 行 |
@@ -216,13 +231,37 @@ index.js 最后修改 2026-10-16 13:58  ← 比它新
 
 所以排查时分三种情况一目了然：**没有日志** = Host 没加载到这一版代码；**只有 mounted、没有 route** = 浏览器半边没调用（槽位/渲染问题）；**有 route 且 `ok:false`** = 调到了但 git/Perforce 侧失败（日志里带原因）。写日志失败绝不影响任何响应（有测试覆盖）。
 
+`revision` 轮询**默认不写日志**（理由见配置表的 `watchDiagnostics`）。排查自动刷新时把它打开，就能看到每次轮询的 `rev` 与 `enabled`；这也是确认「面板到底有没有在轮询」的唯一可靠办法。
+
 ### 与 `git status` 的计数差异
 
 文件数是**逐文件**统计的：`git status` 会把一个整目录的新文件折叠成一条记录（`?? some/dir/`），而本面板把里面的文件逐个列出。实测在一个 78 文件的项目里：`git status --porcelain` 报 77 条，其中把 `packages/web/src/components/markdown/` 折叠成了 1 条；面板展开成它的 2 个文件 → 77 − 1 + 2 = 78。两者描述的是同一批改动。
 
+### 自动刷新（不用再点「刷新」）
+
+面板**自己会更新**：Agent 改完文件，胶囊与浮窗在一两秒内跟上，不需要人手点一下。
+
+关键是不能靠轮询 `state`（一次 0.45 秒、7 条 git 命令）。所以拆成两段：
+
+| 段 | 路由 | 成本 | 频率 |
+|---|---|---|---|
+| **变更检测** | `GET /api/changelist.revision` | 一次内存查表：**不 spawn 任何进程**、不读盘、不写盘 | 可见时 2 秒，后台 8 秒 |
+| **真正读取** | `GET /api/changelist.state` | 7 条 git 命令（P4 侧是 `opened`） | **只有 `rev` 变了才读** |
+
+- **`rev` 是什么**：Host 侧一个进程内单调递增的整数，`0` 表示「我没看到任何变化」。浏览器只做 `!==` 比较——不做大小比较，因为它是进程内序号，插件重挂载或 Host 重启后会从头开始，数字变小同样是「变了」。
+- **Host 怎么知道变了**（`lib/watch.js`，三个信号分层）：
+  1. **精确**：`fs/observed` 的 `observation.version`（`dev:ino:size:mtimeNs:ctimeNs`）。**版本不同才 bump**，同一个版本重复出现只是「又读了一次」，**首次见到只记基线不 bump** —— 否则 agent 每读一个文件都会触发一次全量刷新，比不刷新更糟。
+  2. **粗粒度**：`session/event` 的 `tool/result`，工具不在只读白名单里时 bump 该会话 `cwd`。这一条覆盖 `pwsh`/`bash`/脚本这类**不经过 fs 服务**却会写文件的操作。
+  3. **兜底**：`session/event` 的 `turn/end`（任何结局）无条件 bump。一轮干完了至少刷一次。
+- **静默**：自动读取不显示骨架、不改 `phase`、不清 `notice`（「已拉取 origin」不会因为后台刷新而消失）、保留你选中的文件、且与在途读取合并。工具栏不会闪。
+- **回到窗口时补一次**：外部编辑器改的文件、`git checkout` 换的分支**永远不会 bump**（平台没有 OS 文件监听，`fs/observed` 只覆盖 agent 工具自己的文件操作）。所以从别的窗口切回来时会额外做一次 rev 检查；**若浮窗正开着，还会强制读一次 `state`**。这是覆盖外部改动的唯一合理时机。
+- **节流**：两次自动读取至少间隔 1.2 秒，短时间内的多次变化合并成一次；多个胶囊共用**一个**定时器与**一个**在途请求。
+- **旧版 Host 自动降级**：`revision` 返回 404（Host 半边还是旧版）或网络失败时，该工程**静默停用**自动刷新，手动「刷新」照常可用，**不显示任何错误** —— 增强功能不该让人以为坏了。
+- **只读语义不变**：`revision` 不跑 git/p4、不写任何文件，纯内存计数。
+
 ### 性能
 
-单次 `state` 请求约 **0.45 秒**（78 文件、7 条 git 命令 + 22 个未跟踪文件的读取）；`diff` 只读一个文件。面板是手动刷新（打开浮窗/点刷新/点拉取远端），不做轮询。Perforce 侧的数字是另一套：`opened` **0.1 秒**，子目录本地扫描 **243 毫秒**，而整工作区 `fstat` **28 秒**、全量扫描 **超过 10 分钟**——详见「Perforce 工作区 → 实测性能」。
+单次 `state` 请求约 **0.45 秒**（78 文件、7 条 git 命令 + 22 个未跟踪文件的读取）；`diff` 只读一个文件。**轮询的是 `revision`（内存查表），不是 `state`**：没有变化时每 2 秒只花一次路由 + 几次 map 查找，所以「面板自动更新」没有把风扇转起来。Perforce 侧的数字是另一套：`opened` **0.1 秒**，子目录本地扫描 **243 毫秒**，而整工作区 `fstat` **28 秒**、全量扫描 **超过 10 分钟**——详见「Perforce 工作区 → 实测性能」。
 
 `拉取远端` 是本插件唯一联网的命令。作者所处的受限沙箱无法执行 `git fetch`（其传输需要 shell，被沙箱拒绝），因此该分支只覆盖了「失败时把 git 的消息原样带回、且不影响清单」这一契约；正常情况下它会执行 `git fetch --quiet <remote>`。
 
@@ -319,7 +358,7 @@ node dsh-changelist/extract-from-asar.mjs "C:\Users\you\AppData\Local\Programs\D
 node dsh-changelist/integration-test.mjs ".changelist-test/cordis/node_modules/@deepseek-ai/cordis"
 ```
 
-`npm test` 跑 git 数据层、Host 半边与浏览器半边三个套件（本次改动后 27 + 91 + 202 = 320 项断言全绿）；Perforce 的两个套件单独走 `npm run test:p4` —— **本机仍未跑通**，详见下面的「发布时的已知问题」。`integration-test.mjs` 需要真实 Cordis，单独运行；`p4-e2e.mjs` 需要真实服务器，没有就跳过。
+`npm test` 跑 git 数据层、Host 半边与浏览器半边三个套件（本次改动后 27 + 250 + 337 = 614 项断言全绿）；Perforce 的两个套件单独走 `npm run test:p4` —— **本机仍未跑通**，详见下面的「发布时的已知问题」。`integration-test.mjs` 需要真实 Cordis，单独运行；`p4-e2e.mjs` 需要真实服务器，没有就跳过。
 
 ### 发布时的已知问题（Perforce 套件）
 
@@ -346,8 +385,8 @@ node dsh-changelist/integration-test.mjs ".changelist-test/cordis/node_modules/@
 | 数据层（27 项） | 真实仓库 + 真实 `origin/main`：上游解析、ahead/behind、`--name-status -z` / `--numstat -z` 解析、重命名、未跟踪、二进制、删除、对比合成、非仓库目录、路径遍历防护；夹具自身被 `GIT_CEILING_DIRECTORIES` 与所在包的 git 检出隔离（否则「不是 git 工作区」这条断言会随启动目录变化） |
 | Perforce 数据层（86 项） | `p4-fixture.mjs` 的假 p4：`-ztag` 解析、`opened`/`status`/`fstat`/`changes` 映射、changelist 与 shelved、depot↔本地路径映射、超时与降级；以及 `readP4VConfig` 对 `connectionmap.xml` / `ApplicationSettings.xml` 的读取（主机名优先于 IP、逗号工作区名、Buffer 输入、无 P4V 时静默、无可读 home 时返回 null 而不是抛错） |
 | 对抗性验证（`verify-p4.mjs`，143 项） | 独立于作者的边界探测：检测顺序与 60 秒缓存、只读命令审计（含 `p4 help status` 佐证）、`maxFiles`/`maxDiffBytes` 边界、客户端视图外的 shelved、环境剥离、以及本文档若干断言的逐条复核；7 个已修问题各有 `OK RESOLVED` 挂钩的断言；对真实服务器的"opened 集合按 action 分组后原样往返"（不写死文件数——工作区内容会变） |
-| Host 半边（163 项） | 真实路由处理器 → 真实 git → JSON：四条路由注册在 `/api/` 围栏内、GET + buffered、effect 拥有 6 个 disposer（1 个卸载钩子 + 4 条路由 + 1 个注意力订阅释放）且 yield 的全是函数、`dir` 的 403/400 鉴权、**`sessionId` 由 Host 解析工作目录且未知会话返回 404**、目录去重与容错（服务抛错 / 返回非数组 / 工作区根取值异常都不影响路由）、缺 git 时结构化失败、`fetch=1` 无论成败都带 git 的消息且不影响清单、`maxFiles`/`maxDiffBytes` 截断与提示、`vcs=auto|git|p4` 分派与 `depotPath` 校验；**强制某一种后端时不再探测另一种工具**（`vcs=git` 在 git 仓库上零 p4 进程，`vcs=auto` 仍会并行探测两者）；**并发相同请求只执行一次读取**（两个并发 state 请求共享同一次 git 读取，各拿到一份可独立消费的响应）；**活动日志**（挂载/卸载/每次路由命中与结果，诊断路径不可写时也不影响响应，写日志不阻塞响应）；**无连接配置时也按发现到的 P4V 连接判定为 Perforce、把 `options.discovered` 回显给面板、并让显式请求参数优先**（用 `deps.readP4VConfig` 注入，不依赖跑测试的那台机器）；**注意力路由**（注册态 4 条路由、`ok:true` + `schemaVersion:1` + 五键 `counts`、`dir`/`sessionId` 查询被忽略不放权、`attentionEnabled:false` 短路成 `enabled:false` + 空列表、`session/event` 订阅经 effect 释放、正常响应里没有 `enabled` 键） |
-| 浏览器半边（252 项 = 既有 185 + 21 项补强 + 本轮 46） | ModuleLoader 契约；**四个**表面注册到 `conversation.session.header.utilities`、`shell.overlay`（浮窗 + 向导面板）、`sidebar.footer.action`（状态药丸）；胶囊显示文件数与 `+/−`、状态点、hover 摘要；**点击胶囊打开浮窗**（表头/清单/对比着色/切换器/提示/请求 URL）；**Esc 关闭**、**点击浮窗与胶囊之外的任何地方关闭**；浮窗**锚定在胶囊下方**、视口不够高时自动翻到上方、量不到位置时回落到样式表默认；**当前会话永远优先于记忆目录**（并把污染过的那份记忆改用 `.v2` 键丢弃）、**会话出现较晚或在同一窗口切换会话时会自动改瞄**（修掉了实测到的挂载竞态）、会话不在列表里也能按 `sessionId` 定位、失败状态下目录选择器依然可用、**浮窗常驻显示被检查的目录**并显示 git 的原话与「可 git init」提示、非 git 工作区在胶囊上呈中性色（不是报错色）；旧版 Host 只认 `dir` 时自动重试并提示「Host 半边版本较旧」；locale 不可用时仍注册并渲染（回退显示消息键）。**本轮补强**：刷新后若选中的文件已不在清单里，选中项改到新清单的第一个并**重新读取它的对比**（不再出现「表头是新路径、内容是旧文件」）、连续快速点两个文件时**慢的旧回答不会覆盖新文件**、文件行目录与文件名分两段渲染（窄宽度先省目录、文件名始终可见）、双击行复制路径并给出「已复制/复制失败」反馈、表头显示本次读取时间、加载中显示骨架行而不是空白。**跨项目状态提示**：药丸按最严重状态着色与取词、`▲` 插入符与气泡只在有等待时出现且看过即收起、新建等待重新出现、面板按工作区分组并按 waiting→error→done 排序、行内 `状态 · 原因 · 多久前` 与「打开」、打开把非 waiting 行标记已读、`全部标记已读`、`waiting` 打开后仍计数、`enabled:false` 时不渲染任何表面并清掉标题前缀、标题 `(N) ` 前缀随未读增减且全清后恢复、系统通知只在状态**转移**时发、`running` 永不通知、可见窗口不发 `done`、同一状态重复轮询不重发、2 秒合并成一条、通知 `tag` 去重、权限 denied 时不发也不追问、以及**用 Host 真实抓取的 wire 结构做契约夹具**（含反斜杠 `dir` 仍按 `workspace` 分组）。Perforce 侧在同一套件里覆盖：`vcs=auto|p4` 请求参数与 v3 记忆键（含无法识别的取值退回 `auto`）、胶囊 `P4` 标记、changelist 分组与折叠（状态在 store、按目标记忆）、本地未 opened 分组、shelved / `needsSync` 徽标、连接面板覆盖项与 `localEdits=1|0`（并断言「应用」不写任何本地存储）、`p4-unavailable`/`not-a-workspace` 的降级渲染、无 `changelists` 时回退扁平清单；**后端选择按目标记忆**（15b：一个窗口在 P4 工程与 git 工程之间切换时，两边互不继承，含旧版单一全局键的兼容回退）、**连接信息按目标记忆**（14c：在 A 工程填的 port/user 绝不随 B 工程的请求发出，回到 A 仍然生效）、**P4 连不上且什么都没读到时会自动展开「连接」面板并说明原因**，而 git/正常回答不会弹面板 |
+| Host 半边（250 项） | 真实路由处理器 → 真实 git → JSON：**五条**路由注册在 `/api/` 围栏内、GET + buffered、effect 拥有 **8 个 disposer**（1 个卸载钩子 + 5 条路由 + 1 个注意力订阅 + 1 个变更检测订阅）且 yield 的全是函数、`dir` 的 403/400 鉴权、**`sessionId` 由 Host 解析工作目录且未知会话返回 404**、目录去重与容错（服务抛错 / 返回非数组 / 工作区根取值异常都不影响路由）、缺 git 时结构化失败、`fetch=1` 无论成败都带 git 的消息且不影响清单、`maxFiles`/`maxDiffBytes` 截断与提示、`vcs=auto|git|p4` 分派与 `depotPath` 校验；**强制某一种后端时不再探测另一种工具**（`vcs=git` 在 git 仓库上零 p4 进程，`vcs=auto` 仍会并行探测两者）；**并发相同请求只执行一次读取**（两个并发 state 请求共享同一次 git 读取，各拿到一份可独立消费的响应）；**活动日志**（挂载/卸载/每次路由命中与结果，诊断路径不可写时也不影响响应，写日志不阻塞响应）；**无连接配置时也按发现到的 P4V 连接判定为 Perforce、把 `options.discovered` 回显给面板、并让显式请求参数优先**（用 `deps.readP4VConfig` 注入，不依赖跑测试的那台机器）；**注意力路由**（`ok:true` + `schemaVersion:1` + 五键 `counts`、`dir`/`sessionId` 查询被忽略不放权、`attentionEnabled:false` 短路成 `enabled:false` + 空列表、`session/event` 订阅经 effect 释放、正常响应里没有 `enabled` 键）；**变更检测路由**（`revision` 不发任何子进程、`ok:true` + `{dir,rev,at,enabled}`、`fs/observed` 版本相同不 bump / 变化才 bump / 首次只见基线、`tool/result`（非只读工具）与 `turn/end` 各 bump 一次、表上限按最近一次 bump 淘汰、大小写与斜杠归一、`watchEnabled:false` 时 `rev:0` 且零订阅、未知会话 404 / 未授权 403 / 形态非法 400 与 `state` 同形、`state` 的三种后端分支与 `ok:false` 兜底都带 `rev` 且取值在**读取开始前**采样（读中发生的变化留给下一次轮询）、`watchDiagnostics` 门控轮询日志） |
+| 浏览器半边（337 项 = 既有 271 + 本轮 66） | ModuleLoader 契约；**四个**表面注册到 `conversation.session.header.utilities`、`shell.overlay`（浮窗 + 向导面板）、`sidebar.footer.action`（状态药丸）；胶囊显示文件数与 `+/−`、状态点、hover 摘要；**点击胶囊打开浮窗**（表头/清单/对比着色/切换器/提示/请求 URL）；**Esc 关闭**、**点击浮窗与胶囊之外的任何地方关闭**；浮窗**锚定在胶囊下方**、视口不够高时自动翻到上方、量不到位置时回落到样式表默认；**当前会话永远优先于记忆目录**（并把污染过的那份记忆改用 `.v2` 键丢弃）、**会话出现较晚或在同一窗口切换会话时会自动改瞄**（修掉了实测到的挂载竞态）、会话不在列表里也能按 `sessionId` 定位、失败状态下目录选择器依然可用、**浮窗常驻显示被检查的目录**并显示 git 的原话与「可 git init」提示、非 git 工作区在胶囊上呈中性色（不是报错色）；旧版 Host 只认 `dir` 时自动重试并提示「Host 半边版本较旧」；locale 不可用时仍注册并渲染（回退显示消息键）。**本轮补强**：刷新后若选中的文件已不在清单里，选中项改到新清单的第一个并**重新读取它的对比**（不再出现「表头是新路径、内容是旧文件」）、连续快速点两个文件时**慢的旧回答不会覆盖新文件**、文件行目录与文件名分两段渲染（窄宽度先省目录、文件名始终可见）、双击行复制路径并给出「已复制/复制失败」反馈、表头显示本次读取时间、加载中显示骨架行而不是空白。**自动刷新**：rev 变化→**恰好一次** state 读取、rev 不变→**零次**、自动读取期间 `phase`/`selected`/`notice` 全不变且 `busy` 在每一次 emit 上都不为 true（工具栏不闪）、`minAutoMs` 内多次变化合并成一次且变化不丢、隐藏时降频、回到可见立即检查并在浮窗开着时强制补读、`revision` 404→该目标静默停用且不再请求、`phase`/`error` 保持原样、卸载后引用计数归零并清 timer（不再轮询）、多 surface 共用一个 timer 与一个在途请求、rev 只做 `!==`（同 target 从 5 降到 3 也照样读一次）、跨 target 各自独立基线（A=37 切到 B=5 不误判为回退）、**基线取「轮询到的 rev」而不是回答里的 rev**（poll=21/answer=22 时下一轮仍会读 22）、自动读取不抢占用户刚点的刷新（跳过本轮、基线不记、下轮重试）、安装时的 `revision` 请求不带 `vcs`。**跨项目状态提示**：药丸按最严重状态着色与取词、`▲` 插入符与气泡只在有等待时出现且看过即收起、新建等待重新出现、面板按工作区分组并按 waiting→error→done 排序、行内 `状态 · 原因 · 多久前` 与「打开」、打开把非 waiting 行标记已读、`全部标记已读`、`waiting` 打开后仍计数、`enabled:false` 时不渲染任何表面并清掉标题前缀、标题 `(N) ` 前缀随未读增减且全清后恢复、系统通知只在状态**转移**时发、`running` 永不通知、可见窗口不发 `done`、同一状态重复轮询不重发、2 秒合并成一条、通知 `tag` 去重、权限 denied 时不发也不追问、以及**用 Host 真实抓取的 wire 结构做契约夹具**（含反斜杠 `dir` 仍按 `workspace` 分组）。Perforce 侧在同一套件里覆盖：`vcs=auto|p4` 请求参数与 v3 记忆键（含无法识别的取值退回 `auto`）、胶囊 `P4` 标记、changelist 分组与折叠（状态在 store、按目标记忆）、本地未 opened 分组、shelved / `needsSync` 徽标、连接面板覆盖项与 `localEdits=1|0`（并断言「应用」不写任何本地存储）、`p4-unavailable`/`not-a-workspace` 的降级渲染、无 `changelists` 时回退扁平清单；**后端选择按目标记忆**（15b：一个窗口在 P4 工程与 git 工程之间切换时，两边互不继承，含旧版单一全局键的兼容回退）、**连接信息按目标记忆**（14c：在 A 工程填的 port/user 绝不随 B 工程的请求发出，回到 A 仍然生效）、**P4 连不上且什么都没读到时会自动展开「连接」面板并说明原因**，而 git/正常回答不会弹面板 |
 | 真实 Cordis（15 项） | 注入服务就绪前插件保持 pending、就绪后注册 3 条 `/api` 路由（本版已有 4 条，该套件只断言它关心的 3 条）、真实 `Request` → `Response`、`ctx.get` 对缺失服务返回 undefined、**卸载后 3 条路由全部释放** |
 | 真实服务器端到端（8 项） | 本机 `p4.example.com:1666`（= `192.0.2.10:1666`）：真实 `opened` → 真实对比、状态不触发整工作区枚举、**P4V 界面里的主机名与 IP 解析到同一个 client/root**、`vcs=git` 在纯 Perforce 目录上如实降级 |
 
@@ -355,11 +394,11 @@ node dsh-changelist/integration-test.mjs ".changelist-test/cordis/node_modules/@
 
 ```
 node selftest.mjs      27/27
-node host-test.mjs     163/163
-node client-test.mjs   252/252
+node host-test.mjs     250/250
+node client-test.mjs   337/337
 ```
 
-前三者由 `npm test` 串行执行（共 442 项，全绿）。`p4-test.mjs` / `verify-p4.mjs` / `p4-e2e.mjs` 需单独运行：本机 p4 套件仍卡在探针断言（见上面的「发布时的已知问题」），`p4-e2e.mjs` 需要真实服务器。全部夹具都锚定到包目录（`import.meta.url`）而不是当前工作目录，所以从包目录或工作区根目录运行结果一致。
+前三者由 `npm test` 串行执行（共 614 项，全绿）。`p4-test.mjs` / `verify-p4.mjs` / `p4-e2e.mjs` 需单独运行：本机 p4 套件仍卡在探针断言（见上面的「发布时的已知问题」），`p4-e2e.mjs` 需要真实服务器。全部夹具都锚定到包目录（`import.meta.url`）而不是当前工作目录，所以从包目录或工作区根目录运行结果一致。
 
 > **不要并发跑这些套件**：`host-test.mjs` 与 `selftest.mjs` 在 `import` 时就**销毁并重建** `.changelist-test/fixture/`，两个进程同时跑会把夹具改成半成品（表现为 `EPERM`、`fatal: not a git repository`）。串行执行是唯一安全用法。
 
@@ -375,11 +414,12 @@ node client-test.mjs   252/252
 
 | 文件 | 作用 |
 |---|---|
-| `index.js` | Host 半边：`/api/changelist.targets` / `.state` / `.diff` / `.attention` 四条路由、`sessionId`/`dir` 目标解析与鉴权、`vcs=auto|git|p4` 分派、带超时与剥离环境的 git runner、显式构造环境的 p4 runner（含 `p4port`/`p4user`/`p4client`/`p4charset`/`localEdits` 查询参数）；注意力路由不 spawn 任何进程 |
+| `index.js` | Host 半边：`/api/changelist.targets` / `.state` / `.diff` / `.attention` / `.revision` 五条路由、`sessionId`/`dir` 目标解析与鉴权、`vcs=auto|git|p4` 分派、带超时与剥离环境的 git runner、显式构造环境的 p4 runner（含 `p4port`/`p4user`/`p4client`/`p4charset`/`localEdits` 查询参数）；注意力路由不 spawn 任何进程 |
 | `lib/git.js` | 纯数据层：基准解析、`--name-status -z` / `--numstat -z` 解析、未跟踪文件合成、对比截断（`run`/`readFile` 可注入） |
 | `lib/p4.js` | Perforce 纯数据层：`-ztag` 解析、`p4Environment`、工作区探测、`readWorkspace`/`readDiff`（无 DSH import，`run` 可注入） |
 | `lib/vcs.js` | 后端路由：按目录在 git / Perforce 之间选择，60 秒 TTL 缓存，报出 `available` 与失败原因 |
 | `lib/attention.js` | 注意力数据层：把 Host 的 `session/event` 折成每会话一条记录（running/done/error/waiting/idle），`on`/`now` 可注入；不 spawn、不写盘 |
+| `lib/watch.js` | 变更检测数据层：把 `fs/observed` 的版本变化与 `session/event` 的 `tool/result`/`turn/end` 折成**按目录的单调递增 `rev`**，供自动刷新轮询；不 spawn、不写盘、有界（路径 4096 / 目录 256，按最近一次 bump 淘汰） |
 | `client.js` | 浏览器半边：会话头部胶囊（`conversation.session.header.utilities`）+ 浮窗（`shell.overlay`）+ 跨项目状态药丸（`sidebar.footer.action`）与向导面板（`shell.overlay`），共享模块级 store，自注入 `<style>`，仅用 `--dsw-alias-*` 主题 token；含后端切换器、changelist 分组、shelved 徽标、连接面板、系统通知与标题前缀 |
 | `cordis.patch.yml` | bundle 补丁：插入一行 `changelist`，同时挂载两个半边 |
 | `test-fixture.mjs` | 自包含测试夹具：真实仓库 + bare 远端 + 受限沙箱可用的 runner |

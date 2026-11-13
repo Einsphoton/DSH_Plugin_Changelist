@@ -162,6 +162,15 @@ const fetchStub = async (url) => {
       },
     }
   }
+  if (stateReject && String(url).includes('.state')) {
+    return {
+      ok: false,
+      status: 500,
+      async json() {
+        return { ok: false, message: '读取失败：进程被结束了' }
+      },
+    }
+  }
   if (stateFails && String(url).includes('.state')) {
     return {
       ok: true,
@@ -199,6 +208,32 @@ const fetchStub = async (url) => {
       },
     }
   }
+  // The `revision` route the automatic-refresh poll reads. It answers a plain
+  // in-memory counter (`rev`), exactly as the Host half does, so a test can move
+  // the number without rebuilding a fixture. `revisionReject` answers the way a
+  // Host half from before this route exists: 404 with no body.
+  if (String(url).includes('.revision')) {
+    revisionRequests.push(String(url))
+    if (revisionGate) await revisionGate.promise
+    if (revisionReject) {
+      return {
+        ok: false,
+        status: 404,
+        async json() {
+          throw new Error('no body')
+        },
+      }
+    }
+    if (revisionFails) throw new Error('network is down')
+    const body = { ok: true, dir: SESSION_DIR, at: 0, enabled: true, ...revisionPayload }
+    return {
+      ok: true,
+      status: 200,
+      async json() {
+        return body
+      },
+    }
+  }
   // Optional: a p4-shaped `.state` answer for the Perforce UI coverage that
   // follows. `null` (the default) keeps the original git payload in charge, so
   // every assertion above sees exactly what it saw before.
@@ -228,6 +263,9 @@ const fetchStub = async (url) => {
 }
 let rejectSessionId = false
 let stateFails = false
+// A `.state` read that fails hard (500), used to prove a background read cannot
+// paint an error over the list the reader is already looking at.
+let stateReject = false
 let p4StatePayload = null
 // The cross-project attention answer, driven only by the section that covers
 // it; `null` everywhere else keeps the older sections untouched.
@@ -242,6 +280,14 @@ let gitStatePayload = null
 const diffByPath = new Map()
 const diffGates = new Map()
 const stateGates = new Map()
+// Automatic refresh (task-2): the cheap `revision` counter the Host answers with.
+// Every section before the auto-refresh one leaves `revisionPayload` at its
+// default (`rev:0`), so their request sequences are unchanged.
+const revisionRequests = []
+let revisionPayload = { rev: 0 }
+let revisionReject = false
+let revisionFails = false
+let revisionGate = null
 function deferred() {
   let resolve
   const promise = new Promise((done) => {
@@ -277,6 +323,14 @@ globalThis.window = window
 globalThis.document = document
 globalThis.fetch = fetchStub
 
+// ---------------------------------------------------------------- automatic refresh cadence
+// Every section before 18 is about something else, and a chip mount now also
+// arms the 2-second revision poll. The sections below assert on exact request
+// sequences (`requests.slice(0, 2)`, `requests[0]`), so the poll is parked at a
+// cadence no `settle()` (20 ms) can reach. Section 18 drives the watcher through
+// its own test seam at short intervals instead of waiting on wall-clock time.
+const PARKED_POLL_MS = 60 * 60 * 1000
+
 // ---------------------------------------------------------------- load the module
 console.log('1. module contract')
 const evaluate = new Function('window', 'document', 'fetch', 'URL', 'URLSearchParams', 'console', `${source}\nreturn undefined`)
@@ -284,12 +338,35 @@ evaluate(window, document, fetchStub, URL, URLSearchParams, console)
 checkThat('client.js registers one factory', captured !== null && typeof captured.factory === 'function', String(captured))
 check('factory id', captured.id, '@local/dsh-changelist')
 
+// The review of the automatic refresh (section 18) is the only place that may
+// see a live poll. Every module instance a section spins up mounts a chip whose
+// effect the React shim never cleans up, so a live 2-second timer per instance
+// would fire in the middle of an unrelated request-count assertion. Park the
+// cadence on the way out of the factory, but keep the numbers it was born with
+// so section 18 can still assert the contract's defaults.
+const rawFactory = captured.factory
+captured.factory = (require) => {
+  const instance = rawFactory(require)
+  const tuning = instance.changeInternals.tuning
+  tuning.pollVisibleMs = PARKED_POLL_MS
+  tuning.pollHiddenMs = PARKED_POLL_MS
+  return instance
+}
+
 const mod = captured.factory((name) => {
   if (name === 'react') return React
   throw new Error(`unexpected require: ${name}`)
 })
 check('inject list', mod.inject, ['slots', 'locale', 'sessions'])
 check('apply is a function', typeof mod.apply, 'function')
+check('the polling defaults are the contract’s', mod.changeInternals.productionTuning, {
+  pollVisibleMs: 2000,
+  pollHiddenMs: 8000,
+  minAutoMs: 1200,
+})
+// Section 18 restores the real cadence on its own instance to assert the delay
+// a mount arms; nothing else may see it.
+const productionPollVisibleMs = mod.changeInternals.productionTuning.pollVisibleMs
 
 // ---------------------------------------------------------------- apply + registration
 console.log('2. slot and locale registration')
@@ -2212,6 +2289,430 @@ checkThat(
   'a state colour is missing',
 )
 checkThat('the guide panel has its own row and group rules', pluginCss.includes('.dshAt_row{') && pluginCss.includes('.dshAt_groupHead{'), 'attention rules missing')
+
+// ════════════════════════════════════════════════════════════════════════════
+// 18. automatic refresh (contract §5): a cheap `revision` poll drives the
+//     expensive `state` read. Appended last so every section above keeps its
+//     original request sequence; this section owns its own module instance so
+//     it can drive the watcher through `changeInternals` instead of waiting on
+//     wall-clock time.
+// ════════════════════════════════════════════════════════════════════════════
+console.log('18. automatic refresh: one revision poll, a state read only on a real change')
+{
+  const autoRegistered = []
+  const autoMod = captured.factory((name) => {
+    if (name === 'react') return React
+    throw new Error(`unexpected require: ${name}`)
+  })
+  autoMod.apply({
+    effect(fn) {
+      void fn()
+    },
+    sessions: { open() {}, list: { getSnapshot: () => ({ byId: {} }) } },
+    locale: ctx.locale,
+    slots: {
+      inject(owner, register) {
+        void register()
+      },
+      register(options, component) {
+        autoRegistered.push({ ...options, component })
+        return () => {}
+      },
+    },
+  })
+  const autoChip = autoRegistered.find((entry) => entry.id === 'changelist.chip')
+  const autoPopover = autoRegistered.find((entry) => entry.id === 'changelist.popover')
+  checkThat('the auto-refresh fixture registered its surfaces', Boolean(autoChip && autoPopover), JSON.stringify(autoRegistered.map((e) => e.id)))
+
+  const internals = autoMod.changeInternals
+  const tuning = internals.tuning
+  const store = internals.store
+  // This instance was born with the contract's numbers; the harness parked them
+  // afterwards (see the factory wrapper above), so assert the captured defaults.
+  check('the production cadence is 2000/8000/1200', internals.productionTuning, {
+    pollVisibleMs: 2000,
+    pollHiddenMs: 8000,
+    minAutoMs: 1200,
+  })
+  // Park the timer: every step below drives one tick through the seam, so a
+  // live 2-second timer would only add unaccounted requests. Section 18f sets
+  // the real values back for the one assertion about the armed delay.
+  tuning.pollVisibleMs = PARKED_POLL_MS
+  tuning.pollHiddenMs = PARKED_POLL_MS
+
+  const revisionUrl = () => revisionRequests.at(-1) ?? ''
+  const stateReads = () => requests.filter((url) => url.includes('api/changelist.state'))
+  const resetCounts = () => {
+    requests.length = 0
+    revisionRequests.length = 0
+  }
+  // The throttle is wall-clock; a test step asserts what the *next* poll does,
+  // so it declares "enough time has passed" rather than sleeping 1.2 s.
+  const elapsed = () => {
+    internals.watcher.lastAutoReadAt = 0
+  }
+
+  // ── 18a. the chip drives the watcher, and the query matches `state` minus vcs
+  revisionPayload = { rev: 0 }
+  revisionReject = false
+  revisionFails = false
+  resetCounts()
+  hookQueue.length = 0
+  expand(React.createElement(autoChip.component, { t, sessionId: SESSION_ID }))
+  await settle()
+  checkThat('mounting a chip arms the shared watcher', internals.users() >= 1, String(internals.users()))
+  // The mount's own read is the baseline; park the timer so nothing else moves.
+  internals.reset()
+  expand(React.createElement(autoChip.component, { t, sessionId: SESSION_ID }))
+  internals.reset()
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  const revQuery = parseQuery(revisionUrl())
+  check('the poll asks the revision route', String(revisionUrl()).includes('api/changelist.revision'), true)
+  check('the poll targets the session, like state', revQuery.sessionId, SESSION_ID)
+  checkThat('the poll never sends vcs (it cannot change whether a directory moved)', !('vcs' in revQuery), JSON.stringify(revQuery))
+  check('and it sends no fetch flag', !('fetch' in revQuery), true)
+
+  // ── 18b. an unchanged rev reads no state at all
+  resetCounts()
+  await internals.tick({ t })
+  await internals.tick({ t })
+  await settle()
+  check('a repeated rev performs zero state reads', stateReads().length, 0)
+  checkThat('but it does keep polling the cheap route', revisionRequests.length === 2, revisionRequests.join(' | '))
+
+  // ── 18b2. concurrent callers share ONE in-flight request
+  // A visibility change, a focus event and a timer tick can overlap. If each
+  // fired its own request the cheap endpoint would stop being cheap.
+  resetCounts()
+  {
+    const gate = deferred()
+    revisionGate = gate
+    const overlap = [internals.tick({ t }), internals.tick({ t }), internals.revision()]
+    gate.resolve()
+    revisionGate = null
+    await Promise.all(overlap)
+    await settle()
+    check('three overlapping polls make exactly one request', revisionRequests.length, 1)
+  }
+
+  // ── 18c. a changed rev reads the state exactly once
+  resetCounts()
+  revisionPayload = { rev: 7 }
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  check('a moved rev performs exactly one state read', stateReads().length, 1)
+  checkThat('the read is the ordinary state route', String(stateReads()[0]).includes('api/changelist.state'), stateReads()[0])
+
+  // ── 18d. the silent read leaves phase, selection and notice alone
+  const openPopover = async () => {
+    hookQueue.length = 0
+    if (byClass(expand(React.createElement(autoPopover.component, { t })), 'dshCl_pop').length === 0) {
+      const chipTree = expand(React.createElement(autoChip.component, { t, sessionId: SESSION_ID }))
+      const chipBtn = find(chipTree, (n) => typeof n.props?.onClick === 'function' && String(n.props.className).includes('dshCl_chip'))
+      chipBtn?.props?.onClick?.({ currentTarget: { getBoundingClientRect: () => ({ top: 20, bottom: 48, right: 900 }) } })
+      await settle()
+    }
+    hookQueue.length = 0
+    return expand(React.createElement(autoPopover.component, { t }))
+  }
+  let autoPop = await openPopover()
+  checkThat('the summary is open for the silence check', autoPop !== null && collectClasses(autoPop).includes('dshCl_pop'), String(autoPop?.props?.className))
+  // Pin a selection that is NOT the first file, and a notice like a fetch leaves.
+  store.set({ selected: 'blob.bin', notice: '已拉取 origin' })
+  const before = store.get()
+  const phasesSeen = []
+  let busySeen = false
+  const unsubscribe = store.subscribe(() => {
+    if (!phasesSeen.includes(store.get().phase)) phasesSeen.push(store.get().phase)
+    if (store.get().busy === true) busySeen = true
+  })
+  resetCounts()
+  revisionPayload = { rev: 8 }
+  elapsed()
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  unsubscribe()
+  const after = store.get()
+  check('the automatic read happened', stateReads().length, 1)
+  check('it never enters the loading phase', phasesSeen.includes('loading'), false)
+  check('phase is unchanged by it', after.phase, before.phase)
+  check('the selected file is preserved', after.selected, 'blob.bin')
+  check('and the notice survives the silent read', after.notice, '已拉取 origin')
+  check('busy is never claimed by it', after.busy, false)
+  // The toolbar must not even flicker: `busy` is asserted on every emission the
+  // read caused, not just on the final snapshot.
+  check('the busy flag is never set at any point (the toolbar never flickers)', busySeen, false)
+  autoPop = await openPopover()
+  checkThat('the pane still shows the selected file', collectText(autoPop).length > 0, collectText(autoPop).slice(-200))
+
+  // ── 18e. minAutoMs collapses a burst into one read, and the change survives
+  tuning.minAutoMs = 1200
+  internals.reset()
+  expand(React.createElement(autoChip.component, { t, sessionId: SESSION_ID }))
+  internals.reset()
+  resetCounts()
+  await internals.tick({ t }) // adopts the baseline (rev 8)
+  await settle()
+  resetCounts()
+  revisionPayload = { rev: 9 }
+  // Within the throttle window: no read may start.
+  internals.watcher.lastAutoReadAt = Date.now()
+  await internals.tick({ t })
+  await settle()
+  check('a change inside minAutoMs is deferred, not read', stateReads().length, 0)
+  // The very same change is retried on the next poll once the window passes,
+  // which is what keeps a burst from being lost.
+  internals.watcher.lastAutoReadAt = Date.now() - 5000
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  check('the deferred change is picked up on the next poll', stateReads().length, 1)
+  revisionPayload = { rev: 10 }
+  internals.watcher.lastAutoReadAt = Date.now() - 5000
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  check('a second change reads again (the rev is not stuck)', stateReads().length, 2)
+
+  // ── 18f. a hidden tab polls at the slower cadence
+  tuning.pollVisibleMs = 2000
+  tuning.pollHiddenMs = 8000
+  document.visibilityState = 'hidden'
+  {
+    const release = internals.mount(t)
+    check('a hidden tab arms the slow poll', internals.armedDelay(), 8000)
+    release()
+    document.visibilityState = 'visible'
+    const release2 = internals.mount(t)
+    check('a visible tab arms the fast poll', internals.armedDelay(), 2000)
+    release2()
+    check('and the timer stops when the last surface goes', internals.watcher.timer, null)
+  }
+  delete document.visibilityState
+  tuning.pollVisibleMs = PARKED_POLL_MS
+  tuning.pollHiddenMs = PARKED_POLL_MS
+
+  // ── 18g. coming back to the tab compensates for edits the Host never saw
+  // External editors and `git checkout` never bump the revision, so returning
+  // must force one read — but only while the summary is on screen.
+  internals.reset()
+  resetCounts()
+  await openPopover()
+  await settle()
+  revisionPayload = { rev: 10 } // unchanged: the rev check alone would read nothing
+  resetCounts()
+  await internals.visibility({ t })
+  await settle()
+  await settle()
+  check('returning with the summary open forces one state read', stateReads().length, 1)
+  // Closed summary: nothing to compensate, so the rev check is enough.
+  store.set({ open: false })
+  internals.watcher.lastAutoReadAt = 0
+  resetCounts()
+  await internals.visibility({ t })
+  await settle()
+  check('returning with no summary open reads nothing', stateReads().length, 0)
+
+  // ── 18h. an older Host half (404) stops the poll silently
+  internals.reset()
+  resetCounts()
+  await openPopover()
+  await settle()
+  store.set({ notice: '已拉取 origin' })
+  const before404 = store.get()
+  revisionReject = true
+  await internals.tick({ t })
+  await settle()
+  const after404 = store.get()
+  check('a 404 leaves phase untouched', after404.phase, before404.phase)
+  check('a 404 shows no error', after404.error, null)
+  check('a 404 keeps the notice', after404.notice, '已拉取 origin')
+  check('a 404 claims no failure on the chip', after404.ok, undefined)
+  resetCounts()
+  await internals.tick({ t })
+  await internals.tick({ t })
+  await settle()
+  check('after a 404 the route is not called again', revisionRequests.length, 0)
+  check('and no state read is attempted either', stateReads().length, 0)
+  // The reader keeps their own refresh, which must still work.
+  const manualPop = await openPopover()
+  const manualRefresh = find(
+    manualPop,
+    (node) => node.type === 'button' && String(node.props?.className).includes('dshCl_btn') && collectText(node) === '刷新',
+  )
+  revisionReject = false
+  resetCounts()
+  manualRefresh?.props?.onClick?.()
+  await settle()
+  checkThat('the manual refresh still works after the poll gave up', stateReads().length > 0, String(stateReads().length))
+
+  // A network error disables it the same silent way.
+  internals.reset()
+  resetCounts()
+  await openPopover()
+  await settle()
+  revisionFails = true
+  const beforeNet = store.get()
+  await internals.tick({ t })
+  await settle()
+  check('a network error shows no error surface', store.get().error, beforeNet.error ?? null)
+  revisionFails = false
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  check('a network error stops the poll too', revisionRequests.length, 0)
+
+  // ── 18h2. a state read that FAILS in the background is silent too
+  // The revision route can be healthy while one state read is not (the process
+  // was killed mid-turn, a transient error). Painting the error phase over a
+  // list the reader is already reading would be a regression caused by an
+  // enhancement, so a failed background read must leave the panel exactly as it
+  // was and wait for the next poll.
+  internals.reset()
+  resetCounts()
+  await openPopover()
+  await settle()
+  revisionPayload = { rev: 40 }
+  await internals.tick({ t }) // adopt rev 40 with a good read
+  await settle()
+  const beforeFail = store.get()
+  revisionPayload = { rev: 41 }
+  internals.watcher.lastAutoReadAt = 0
+  // Make the state route itself fail while the revision route stays healthy.
+  stateReject = true
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  stateReject = false
+  const afterFail = store.get()
+  checkThat('the failing background read was attempted', stateReads().length > 0, String(stateReads().length))
+  check('a failed background read leaves the phase alone', afterFail.phase, beforeFail.phase)
+  check('a failed background read shows no error', afterFail.error, beforeFail.error ?? null)
+  check('and its list is still on screen', Array.isArray(afterFail.state?.files) && afterFail.state.files.length, 3)
+
+  // ── 18i. one watcher for however many surfaces are mounted
+  internals.reset()
+  resetCounts()
+  tuning.pollVisibleMs = 25
+  tuning.pollHiddenMs = 25
+  const releaseA = internals.mount(t)
+  const firstTimer = internals.watcher.timer
+  const releaseB = internals.mount(t)
+  check('two mounted surfaces share one watcher', internals.users(), 2)
+  checkThat('and there is only one timer', internals.watcher.timer !== null, String(internals.watcher.timer))
+  // The decisive check: a second mount must NOT arm a second timer. If it did,
+  // the single handle would have been replaced and this would be `false`.
+  check('a second mount does not re-arm the timer', internals.watcher.timer === firstTimer, true)
+  releaseA()
+  checkThat('one release keeps the timer alive', internals.watcher.timer !== null, String(internals.watcher.timer))
+  check('and keeps the same timer', internals.watcher.timer === firstTimer, true)
+  releaseB()
+  check('the last release stops the timer (no leak)', internals.watcher.timer, null)
+  check('and drops the reference count', internals.users(), 0)
+  checkThat('so nothing polls after unmount', internals.armedDelay() === null, String(internals.armedDelay()))
+  tuning.pollVisibleMs = PARKED_POLL_MS
+  tuning.pollHiddenMs = PARKED_POLL_MS
+  // The handle being null is not enough on its own: a timer that was never
+  // cleared still FIRES. Run a real short cadence, mount, unmount, and wait past
+  // the interval — an unmounted watcher must make no request at all.
+  //
+  // This runs on a fresh module instance: the React shim above never runs
+  // effect cleanups, so every earlier `expand` in this section left a mounted
+  // reference (and its parked timer) behind in this instance's store. A clean
+  // instance has exactly the timer this check creates.
+  {
+    const leakRegistered = []
+    const leakMod = captured.factory((name) => {
+      if (name === 'react') return React
+      throw new Error(`unexpected require: ${name}`)
+    })
+    leakMod.apply({
+      effect(fn) {
+        void fn()
+      },
+      sessions: { open() {}, list: { getSnapshot: () => ({ byId: {} }) } },
+      locale: ctx.locale,
+      slots: {
+        inject(owner, register) {
+          void register()
+        },
+        register(options, component) {
+          leakRegistered.push({ ...options, component })
+          return () => {}
+        },
+      },
+    })
+    const leak = leakMod.changeInternals
+    leak.store.set({ target: { kind: 'session', id: 'leak', dir: SESSION_DIR, title: '', live: true } })
+    leak.tuning.pollVisibleMs = 15
+    leak.tuning.pollHiddenMs = 15
+    resetCounts()
+    const releaseLeak = leak.mount(t)
+    releaseLeak()
+    await new Promise((resolve) => setTimeout(resolve, 90))
+    check('an unmounted watcher makes no requests after its interval passes', revisionRequests.length, 0)
+    checkThat('and it did not re-arm itself', leak.watcher.timer === null, String(leak.watcher.timer))
+    leak.reset()
+  }
+  tuning.pollVisibleMs = PARKED_POLL_MS
+  tuning.pollHiddenMs = PARKED_POLL_MS
+
+  // ── 18j. the rev is tracked per target, and only ever compared for inequality
+  internals.reset()
+  internals.applied.set('session:one', 37)
+  const otherA = { kind: 'session', id: 'two' }
+  store.set({ target: otherA })
+  revisionPayload = { rev: 5 }
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  check('a smaller rev on another target is adopted, not read as a rollback', stateReads().length, 0)
+  check('and that target now has its own baseline', internals.applied.get('session:two'), 5)
+  // Same target, rev goes backwards (a Host restart): still a change.
+  internals.watcher.lastAutoReadAt = 0
+  revisionPayload = { rev: 3 }
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  check('a lower rev for the same target still triggers a read', stateReads().length, 1)
+
+  // ── 18k. a change that lands DURING the read is left for the next poll
+  // Contract §2: the answer carries the rev sampled before the read. If the
+  // client adopted that number, a second edit in the same turn would be lost.
+  internals.reset()
+  store.set({ target: { kind: 'session', id: 'midread', dir: SESSION_DIR, title: '', live: true } })
+  revisionPayload = { rev: 20 }
+  await internals.tick({ t }) // adopt the baseline
+  await settle()
+  revisionPayload = { rev: 21 } // the poll sees 21…
+  gitStatePayload = { ...statePayload, rev: 22 } // …but the answer reflects 22
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  check('the polled change triggers its read', stateReads().length, 1)
+  check('the applied rev is the POLLED one, not the answer’s', internals.applied.get('session:midread'), 21)
+  // The mid-read change must therefore still be pending for the next poll.
+  internals.watcher.lastAutoReadAt = 0
+  revisionPayload = { rev: 22 }
+  resetCounts()
+  await internals.tick({ t })
+  await settle()
+  await settle()
+  check('and the mid-read change is read on the following poll', stateReads().length, 1)
+  gitStatePayload = null
+
+  // Leave the shared fixtures as the sections above found them.
+  internals.reset()
+  revisionPayload = { rev: 0 }
+  store.set({ open: false, notice: null, selected: null, target: null, state: null })
+}
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

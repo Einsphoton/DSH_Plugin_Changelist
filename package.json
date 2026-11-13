@@ -10,7 +10,8 @@
     "./lib/attention": "./lib/attention.js",
     "./lib/git": "./lib/git.js",
     "./lib/p4": "./lib/p4.js",
-    "./lib/vcs": "./lib/vcs.js"
+    "./lib/vcs": "./lib/vcs.js",
+    "./lib/watch": "./lib/watch.js"
   },
   "files": [
     "index.js",

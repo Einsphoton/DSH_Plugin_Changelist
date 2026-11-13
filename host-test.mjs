@@ -14,6 +14,7 @@ import path from 'node:path'
 
 import { apply, collectTargets, createRoutes, gitEnvironment, safeRepoPath, ROUTES } from './index.js'
 import { createAttentionRegistry, emptyAttentionCounts, ATTENTION_SCHEMA_VERSION } from './lib/attention.js'
+import { createChangeWatcher, isReadOnlyTool, normalizeWatchPath } from './lib/watch.js'
 import { createFileReader, inspectWorkspace } from './lib/git.js'
 import {
   FAKE_P4_CLIENT,
@@ -26,7 +27,7 @@ import {
   readP4Calls,
   resetP4Calls,
 } from './p4-fixture.mjs'
-import { FIXTURE_ROOT, buildFixture, createFixtureRunner, fileRedirectExecFile } from './test-fixture.mjs'
+import { FIXTURE_OUTSIDE, FIXTURE_ROOT, buildFixture, createFixtureRunner, fileRedirectExecFile } from './test-fixture.mjs'
 
 const repo = buildFixture().repo
 // The Perforce fixture is built next to the git one; `p4Repo` is its synthetic
@@ -247,18 +248,19 @@ const applyCtx = {
   },
 }
 apply(applyCtx, { allowedPaths: [repo], diagnosticsPath: path.join(FIXTURE_ROOT, 'diag', 'host.log') }, { execFile: fileRedirectExecFile, on: () => () => {} })
-// Four routes now: the three changelist reads plus the cross-session attention
-// read. The route list is derived from ROUTES, so it cannot disagree with the
-// contract even if a fifth route is added later.
+// Five routes now: the three changelist reads, the cross-session attention read,
+// and the cheap change-detection poll. The route list is derived from ROUTES, so
+// it cannot disagree with the contract even if a sixth route is added later.
 const MOUNTED_ROUTES = Object.values(ROUTES)
-check('three changelist routes plus attention', registered.length, 4)
+check('four changelist routes plus attention', registered.length, 5)
 check('route paths', registered.map((r) => r.path).sort(), MOUNTED_ROUTES.sort())
 checkThat('every route sits inside the /api fence', registered.every((r) => r.path.startsWith('/api/')), registered.map((r) => r.path).join())
 check('every route is GET with a buffered body', registered.every((r) => r.methods.length === 1 && r.methods[0] === 'GET' && r.requestBody === 'buffered'), true)
 check('registrations are effect-owned', applied.length, 1)
-// One disposer each for the unmount log and the four routes, plus the attention
-// registry's `session/event` subscription: unload must release all six.
-checkThat('the effect yields six disposers', applied[0].disposers.length === 6, JSON.stringify(applied[0].disposers.length))
+// One disposer each for the unmount log and the five routes, plus the attention
+// registry's `session/event` subscription and the change watcher's two
+// subscriptions: unload must release all eight.
+checkThat('the effect yields eight disposers', applied[0].disposers.length === 8, JSON.stringify(applied[0].disposers.length))
 checkThat(
   'no yielded value is a promise',
   applied[0].disposers.every((entry) => typeof entry === 'function'),
@@ -823,14 +825,14 @@ const attentionRouteCtx = {
 const EMPTY_SESSIONS = { list: () => [], get: () => undefined }
 apply(attentionRouteCtx, { allowedPaths: [repo], diagnostics: false, diagnosticsPath: attentionLog }, { execFile: fileRedirectExecFile, attentionSessions: EMPTY_SESSIONS })
 const attentionRoute = attentionRegistered.find((route) => route.path === ROUTES.attention)
-checkThat('the attention route is mounted with the other three', Boolean(attentionRoute), JSON.stringify(attentionRegistered.map((route) => route.path)))
-check('the mount is still four routes', attentionRegistered.length, 4)
+checkThat('the attention route is mounted with the other four', Boolean(attentionRoute), JSON.stringify(attentionRegistered.map((route) => route.path)))
+check('the mount is still five routes', attentionRegistered.length, 5)
 check('the attention route is GET+buffered and fenced', {
   path: attentionRoute?.path,
   methods: attentionRoute?.methods,
   requestBody: attentionRoute?.requestBody,
 }, { path: '/api/changelist.attention', methods: ['GET'], requestBody: 'buffered' })
-checkThat('unloading releases the attention subscription too', attentionApplied[0].length === 6, JSON.stringify(attentionApplied[0].length))
+checkThat('unloading releases the attention subscription too', attentionApplied[0].length === 8, JSON.stringify(attentionApplied[0].length))
 
 const attentionResponse = await attentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))
 check('the attention route answers 200', attentionResponse.status, 200)
@@ -880,8 +882,11 @@ const liveCtx = {
   connection: { fetch: { register: (route) => (liveRoutes.push(route), () => {}) } },
 }
 apply(liveCtx, { allowedPaths: [repo], diagnostics: false }, { execFile: fileRedirectExecFile, attentionSessions: EMPTY_SESSIONS })
-check('the plugin subscribed to session/event', liveListeners.filter((entry) => entry.eventName === 'session/event').length, 1)
-check('the plugin mounted four routes', liveRoutes.length, 4)
+// Two subscriptions now: attention folds `session/event`, and the change watcher
+// folds `fs/observed` plus `session/event` (a second, independent listener).
+check('the plugin subscribed to session/event', liveListeners.filter((entry) => entry.eventName === 'session/event').length, 2)
+check('and to fs/observed', liveListeners.filter((entry) => entry.eventName === 'fs/observed').length, 1)
+check('the plugin mounted five routes', liveRoutes.length, 5)
 const liveAttentionRoute = liveRoutes.find((route) => route.path === ROUTES.attention)
 const beforeEvent = await (await liveAttentionRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))).json()
 check('a quiet Host reports an empty list, not an error', [beforeEvent.sessions.length, beforeEvent.counts.waiting], [0, 0])
@@ -925,14 +930,14 @@ const disabledCtx = {
   connection: { fetch: { register: (route) => (disabledRegistered.push(route), () => {}) } },
 }
 apply(disabledCtx, { allowedPaths: [repo], diagnostics: false, attentionEnabled: false }, { execFile: fileRedirectExecFile })
-check('the disabled mount still owns every disposer', disabledApplied[0].length, 6)
+check('the disabled mount still owns every disposer', disabledApplied[0].length, 8)
 const disabledRoute = disabledRegistered.find((route) => route.path === ROUTES.attention)
 const disabledBody = await (await disabledRoute.fetch(new Request(`http://localhost${ROUTES.attention}`))).json()
 check('attentionEnabled:false says so', [disabledBody.ok, disabledBody.enabled], [true, false])
 check('and still carries no sessions', disabledBody.sessions, [])
 check('and still carries all five zeroed counts', disabledBody.counts, { waiting: 0, error: 0, done: 0, running: 0, idle: 0 })
 check('and still carries the schema version', disabledBody.schemaVersion, ATTENTION_SCHEMA_VERSION)
-check('the disabled route is still mounted', disabledRegistered.length, 4)
+check('the disabled route is still mounted', disabledRegistered.length, 5)
 
 // 9b2. A mount with pre-existing sessions must not report an empty world.
 // The registry used to learn only from events emitted AFTER it mounted, so a
@@ -992,40 +997,6 @@ check('the disabled route is still mounted', disabledRegistered.length, 4)
     seededBody.sessions.find((session) => session.workspace === 'Wait')?.reason,
     'approval',
   )
-}
-
-// 9b3. Subagent children are not sessions the reader can act on.
-// A delegated child inherits its parent's cwd, so without a lineage filter every
-// "You are researching ..." / "You are fixing a defect" child appeared as its own
-// row, and none of them can be selected in the client — the exact "打开 does
-// nothing" report. Only top-level sessions belong in this answer.
-{
-  const subNow = 1_700_000_000_000
-  const child = (id, parent) => ({
-    id,
-    header: { cwd: 'K:/w/Parent', origin: 'subagent', parentSession: parent, delegationDepth: 1 },
-    ownEvents: () => [{ type: 'turn/start', turn: 1, time: subNow - 1_000 }],
-  })
-  const liveNow = [
-    { id: 'top-1', header: { cwd: 'K:/w/Parent' }, ownEvents: () => [{ type: 'turn/start', turn: 2, time: subNow - 500 }] },
-    child('child-a', 'top-1'),
-    child('child-b', 'top-1'),
-  ]
-  const seededStore = { list: () => liveNow.slice(), get: (id) => liveNow.find((session) => session.id === id) }
-  const subRoutes = createRoutes(
-    { logger, get: () => undefined },
-    { diagnostics: false },
-    { execFile: fileRedirectExecFile, on: () => () => {}, now: () => subNow, attentionSessions: seededStore },
-  )
-  const subBody = await (await subRoutes.handleAttention(new Request(`http://localhost${ROUTES.attention}`))).json()
-  check('only the top-level session is reported', subBody.sessions.map((session) => session.sessionId), ['top-1'])
-  check('and the delegated children do not inflate the counts', subBody.counts, {
-    waiting: 0,
-    error: 0,
-    done: 0,
-    running: 1,
-    idle: 0,
-  })
 }
 
 // 9b3. Subagent children are not sessions the reader can act on.
@@ -1122,6 +1093,395 @@ check('a throwing snapshot degrades to an empty answer', [survivedThrow.ok, surv
   emptyAttentionCounts(),
 ])
 
+console.log('10. change detection: the cheap revision poll')
+// The whole point of this route is that it is free: a browser polls it every
+// couple of seconds and only reads `state` when the number moves. So the suite
+// pins both halves — the counter's bump rules event by event, and the promise
+// that answering the route never spawns anything.
+
+// 10a. pure helpers: path normalization and the read-only tool classifier.
+check('watch paths fold case and slash and drop the trailing separator', normalizeWatchPath('C:/Work/Repo/'), 'c:\\work\\repo')
+check('watch paths keep a drive root separator', normalizeWatchPath('C:\\'), 'c:\\')
+check('a non-path normalizes to null', [normalizeWatchPath(''), normalizeWatchPath(null), normalizeWatchPath(42)], [null, null, null])
+check('read tools are recognized as read-only', ['read', 'read_many', 'ls', 'glob', 'grep', 'search', 'stat', 'read_image'].map(isReadOnlyTool), [
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+  true,
+])
+check('writing and shell tools are not read-only', ['write', 'edit', 'pwsh', 'bash', 'apply_patch', 'delete'].map(isReadOnlyTool), [
+  false,
+  false,
+  false,
+  false,
+  false,
+  false,
+])
+check('a namespaced tool is judged by its last segment', [isReadOnlyTool('mcp__fs__read'), isReadOnlyTool('mcp__fs__write')], [true, false])
+// The asymmetry that shapes the classifier: a read tool misjudged costs a cheap
+// bump, a writer misjudged LOSES a change until the turn ends. So a plausible
+// writer inside a "read" family must stay change-capable.
+check('a writer that merely starts like a reader stays change-capable', [isReadOnlyTool('find_and_replace'), isReadOnlyTool('search_replace')], [false, false])
+check('an unknown tool counts as change-capable', [isReadOnlyTool('some_new_tool'), isReadOnlyTool(null), isReadOnlyTool('')], [
+  false,
+  false,
+  false,
+])
+
+// 10b. the fs/observed rule: same version never bumps, a new version bumps once.
+const wOn = captureListeners()
+const watcher = createChangeWatcher({ on: wOn, now: () => 9_000_000 })
+check('the watcher subscribes to fs/observed and session/event', wOn.listeners.map((entry) => entry.eventName), [
+  'fs/observed',
+  'session/event',
+])
+const fsTarget = (displayPath, targetKey = displayPath) => ({ targetKey, displayPath })
+const present = (version) => ({ kind: 'present', version })
+/** Emit one `fs/observed` to every live listener, exactly like the Host. */
+function observe(target, observation) {
+  for (const entry of wOn.listeners) if (entry.live && entry.eventName === 'fs/observed') entry.listener(target, observation, {})
+}
+/** Emit one `session/event` to every live listener, exactly like the Host. */
+function emitSession(session, payload) {
+  for (const entry of wOn.listeners) if (entry.live && entry.eventName === 'session/event') entry.listener(session, payload)
+}
+
+const workDir = 'C:\\work\\Repo'
+check('a quiet watcher reports rev 0', watcher.revisionFor(workDir), { rev: 0, at: 0 })
+// The first sighting is a baseline, not evidence: reading a file must not bump.
+observe(fsTarget('C:\\work\\Repo\\src\\a.js'), present('dev:1:10:100:200'))
+check('the first observation only records a baseline', watcher.revisionFor(workDir).rev, 0)
+// The same version again is another read of an unchanged file.
+observe(fsTarget('C:\\work\\Repo\\src\\a.js'), present('dev:1:10:100:200'))
+check('re-observing the same version does not bump', watcher.revisionFor(workDir).rev, 0)
+checkThat('and it did not grow any table', watcher.size === 0)
+// A different version is a write.
+observe(fsTarget('C:\\work\\Repo\\src\\a.js'), present('dev:1:12:300:400'))
+const firstBump = watcher.revisionFor(workDir)
+checkThat('a changed version bumps', firstBump.rev > 0, JSON.stringify(firstBump))
+checkThat('and records when it happened', firstBump.at === 9_000_000, JSON.stringify(firstBump))
+observe(fsTarget('C:\\work\\Repo\\src\\a.js'), present('dev:1:12:300:400'))
+check('the bumped version does not bump again either', watcher.revisionFor(workDir).rev, firstBump.rev)
+// Present -> absent -> present at the same version is still a change.
+observe(fsTarget('C:\\work\\Repo\\src\\a.js'), { kind: 'absent' })
+const afterDelete = watcher.revisionFor(workDir).rev
+checkThat('an absence is a change too', afterDelete > firstBump.rev, `${afterDelete} vs ${firstBump.rev}`)
+
+// Ownership is by display path: a sibling directory must not see it.
+check('a sibling directory sees nothing', watcher.revisionFor('C:\\work\\Other').rev, 0)
+check('an ancestor sees a change below it', watcher.revisionFor('C:\\work').rev, afterDelete)
+check('the changed file\'s own directory sees it', watcher.revisionFor('C:\\work\\Repo\\src').rev, afterDelete)
+check('an unrelated subdirectory sees nothing', watcher.revisionFor('C:\\work\\Repo\\docs').rev, 0)
+check('a prefix that is not a path boundary sees nothing', watcher.revisionFor('C:\\work\\Rep').rev, 0)
+check('the same path in another case is the same directory', watcher.revisionFor('c:/work/repo').rev, afterDelete)
+check('the same path with another separator is the same directory', watcher.revisionFor('C:\\work\\repo\\').rev, afterDelete)
+check('a non-path reports nothing', [watcher.revisionFor(''), watcher.revisionFor(null)], [
+  { rev: 0, at: 0 },
+  { rev: 0, at: 0 },
+])
+checkThat('the tree reports one live path entry', watcher.size === 1, JSON.stringify(watcher.size))
+
+// 10c. the coarse signals: tool/result for a non-read-only tool, and turn/end.
+const sessionA = sessionIn('sess-a', 'C:\\work\\Repo')
+observe(fsTarget('C:\\work\\Other\\b.js'), present('dev:2:1:1:1'))
+observe(fsTarget('C:\\work\\Other\\b.js'), present('dev:2:2:2:2'))
+const beforeTools = watcher.revisionFor(workDir).rev
+emitSession(sessionA, event('tool/call', { callId: 'c1', name: 'read' }))
+emitSession(sessionA, event('tool/result', { message: { source: { callId: 'c1' } } }))
+check('a read tool result does not bump', watcher.revisionFor(workDir).rev, beforeTools)
+emitSession(sessionA, event('tool/call', { callId: 'c2', name: 'pwsh' }))
+emitSession(sessionA, event('tool/result', { message: { source: { callId: 'c2' } } }))
+const afterShell = watcher.revisionFor(workDir).rev
+checkThat('a shell tool result bumps the session cwd', afterShell > beforeTools, `${afterShell} vs ${beforeTools}`)
+// `pwsh` writes files the filesystem service never sees, which is exactly why
+// this coarse signal exists.
+emitSession(sessionA, event('tool/call', { callId: 'c3', name: 'write' }))
+emitSession(sessionA, event('tool/result', { message: { source: { callId: 'c3' } } }))
+const afterWrite = watcher.revisionFor(workDir).rev
+checkThat('a write tool result bumps too', afterWrite > afterShell, `${afterWrite} vs ${afterShell}`)
+emitSession(sessionA, event('turn/end', { turn: 4, reason: { kind: 'completed' } }))
+const afterTurn = watcher.revisionFor(workDir).rev
+checkThat('turn/end bumps once', afterTurn > afterWrite, `${afterTurn} vs ${afterWrite}`)
+emitSession(sessionA, event('turn/end', { turn: 5, reason: { kind: 'error', error: { message: 'x' } } }))
+checkThat('turn/end bumps for every reason', watcher.revisionFor(workDir).rev > afterTurn)
+// A session with no cwd cannot be attributed, and is skipped rather than fatal.
+const beforeOrphan = watcher.revisionFor(workDir).rev
+for (const orphan of [null, undefined, {}, { id: 'x' }, 'not a session', { id: 'x', header: {} }]) {
+  emitSession(orphan, event('turn/end', { turn: 1 }))
+}
+check('an unattributable session is skipped', watcher.revisionFor(workDir).rev, beforeOrphan)
+// A header getter that throws must be contained, not propagated.
+emitSession(
+  { id: 'bad', get header() { throw new Error('header exploded') } },
+  event('turn/end', { turn: 1 }),
+)
+checkThat('a throwing header is contained', true)
+
+// 10d. hostile events never escape a listener.
+const hostileMethods = [
+  () => observe(null, null),
+  () => observe(undefined, present('v')),
+  () => observe({}, { kind: 'present' }),
+  () => observe(new Proxy({}, { get() { throw new Error('target exploded') } }), present('v')),
+  () => observe(fsTarget('C:\\work\\Repo\\c.js'), { get version() { throw new Error('version exploded') } }),
+  () => emitSession(sessionA, null),
+  () => emitSession(sessionA, 'not an event'),
+  () => emitSession(sessionA, {}),
+  () => emitSession(sessionA, { get type() { throw new Error('type exploded') } }),
+  () => emitSession(sessionA, { type: 'tool/result', data: { get message() { throw new Error('data exploded') } } }),
+]
+let hostileSurvived = true
+for (const attempt of hostileMethods) {
+  try {
+    attempt()
+  } catch {
+    hostileSurvived = false
+  }
+}
+check('no hostile event escapes the watcher', hostileSurvived, true)
+checkThat('and the tree still answers', typeof watcher.revisionFor(workDir).rev === 'number')
+
+// 10e. caps and eviction: neither table grows without bound.
+const cappedOn = captureListeners()
+const cappedWatch = createChangeWatcher({ on: cappedOn, now: () => 1_000, limits: { maxPaths: 2, maxDirs: 2 } })
+const emitCapped = (target, observation) => {
+  for (const entry of cappedOn.listeners) if (entry.live && entry.eventName === 'fs/observed') entry.listener(target, observation, {})
+}
+const write = (displayPath, version) => {
+  emitCapped(fsTarget(displayPath), present('baseline'))
+  emitCapped(fsTarget(displayPath), present(version))
+}
+write('D:\\w\\one.txt', 'v1')
+write('D:\\w\\two.txt', 'v1')
+write('D:\\w\\three.txt', 'v1')
+check('the path table evicts its oldest entry', cappedWatch.size <= 2, true)
+check('an evicted path no longer reports a revision', cappedWatch.revisionFor('D:\\w\\one.txt').rev, 0)
+checkThat('the newest path still does', cappedWatch.revisionFor('D:\\w\\three.txt').rev > 0)
+checkThat('and a directory above all of them reports the surviving bumps', cappedWatch.revisionFor('D:\\w').rev > 0)
+
+// 10f. dispose releases both subscriptions and ignores late events.
+const disposeOn = captureListeners()
+const disposeWatch = createChangeWatcher({ on: disposeOn, now: () => 1_000 })
+check('the watcher holds two live subscriptions', disposeOn.live, 2)
+disposeWatch.dispose()
+check('dispose releases both subscriptions', disposeOn.live, 0)
+for (const entry of disposeOn.listeners) {
+  entry.live = true
+  entry.listener({ id: 'late', header: { cwd: 'E:\\w\\Late' } }, event('turn/end', { turn: 1 }))
+  entry.listener(fsTarget('E:\\w\\Late\\a.js'), present('v1'), {})
+  entry.listener(fsTarget('E:\\w\\Late\\a.js'), present('v2'), {})
+  entry.live = false
+}
+check('a disposed watcher ignores late events', disposeWatch.revisionFor('E:\\w\\Late').rev, 0)
+disposeWatch.dispose()
+check('dispose is idempotent', disposeOn.live, 0)
+// No `on` at all: a valid, quiet watcher rather than a crash.
+const unwatched = createChangeWatcher({})
+check('a watcher with no event source is quiet but valid', [unwatched.revisionFor(workDir), unwatched.size], [{ rev: 0, at: 0 }, 0])
+unwatched.dispose()
+
+console.log('10g. the revision route')
+// The route must answer from memory only. `execFile` is counted rather than
+// redirected here: the assertion is that it is never called at all.
+const revisionCalls = []
+const countingExecFile = (file, args, options, callback) => {
+  revisionCalls.push([file, ...args].join(' '))
+  return fileRedirectExecFile(file, args, options, callback)
+}
+const revisionListeners = captureListeners()
+const revisionRoutes = createRoutes(
+  ctx,
+  { allowedPaths: [repo], diagnostics: false },
+  { execFile: countingExecFile, on: revisionListeners, now: () => 1_700_000_000_000 },
+)
+const revisionUrl = `http://localhost${ROUTES.revision}`
+const quietRevision = await revisionRoutes.handleRevision(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))
+check('the revision route answers 200', quietRevision.status, 200)
+check('with JSON', quietRevision.headers.get('content-type'), 'application/json; charset=utf-8')
+const quietBody = await quietRevision.json()
+check('a quiet directory reports rev 0', [quietBody.ok, quietBody.rev, quietBody.at, quietBody.enabled], [true, 0, 0, true])
+check('and names the directory it is about', quietBody.dir, repo)
+check('answering it spawns nothing', revisionCalls, [])
+// The same session-scoped input the chip uses.
+const sessionRevision = await (await revisionRoutes.handleRevision(new Request(`${revisionUrl}?sessionId=s1`))).json()
+check('the sessionId form resolves the session cwd', [sessionRevision.ok, sessionRevision.dir, sessionRevision.rev], [true, repo, 0])
+// A change through the real watcher, then the same route answers a larger rev.
+const repoSession = sessionIn('s1', repo)
+for (const entry of revisionListeners.listeners) {
+  if (entry.live && entry.eventName === 'session/event') entry.listener(repoSession, event('turn/end', { turn: 1 }))
+}
+const movedRevision = await (await revisionRoutes.handleRevision(new Request(`${revisionUrl}?sessionId=s1`))).json()
+checkThat('a turn/end moves the rev the route reports', movedRevision.rev > 0, JSON.stringify(movedRevision))
+checkThat('and it carries the bump time', movedRevision.at === 1_700_000_000_000, JSON.stringify(movedRevision))
+check('the poll still spawned nothing', revisionCalls, [])
+// Same rev on a repeat request: the counter is monotonic, not ever-growing.
+const repeated = await (await revisionRoutes.handleRevision(new Request(`${revisionUrl}?sessionId=s1`))).json()
+check('a repeat poll reports the same rev', repeated.rev, movedRevision.rev)
+
+// 10h. the route's refusals are exactly `state`'s.
+const unknownRevisionSession = await revisionRoutes.handleRevision(new Request(`${revisionUrl}?sessionId=nope`))
+const unknownRevisionBody = await unknownRevisionSession.json()
+check('an unknown session is 404', unknownRevisionSession.status, 404)
+check('with the same refusal shape as state', [unknownRevisionBody.ok, typeof unknownRevisionBody.message], [false, 'string'])
+const deniedRevision = await revisionRoutes.handleRevision(new Request(`${revisionUrl}?dir=${encodeURIComponent(FIXTURE_ROOT)}`))
+check('an unauthorized directory is 403', deniedRevision.status, 403)
+const badRevisionDir = await revisionRoutes.handleRevision(new Request(`${revisionUrl}?dir=relative/path`))
+check('a malformed directory is 400', badRevisionDir.status, 400)
+check('no refusal spawned anything either', revisionCalls, [])
+
+// 10i. watchEnabled:false answers rev 0 and subscribes to nothing.
+const offListeners = captureListeners()
+const offRoutes = createRoutes(
+  ctx,
+  { allowedPaths: [repo], diagnostics: false, watchEnabled: false },
+  { execFile: fileRedirectExecFile, on: offListeners },
+)
+check('watchEnabled:false subscribes to no fs events', offListeners.listeners.filter((entry) => entry.eventName === 'fs/observed').length, 0)
+const offBody = await (await offRoutes.handleRevision(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))).json()
+check('and the route says so', [offBody.ok, offBody.rev, offBody.enabled], [true, 0, false])
+for (const entry of offListeners.listeners) {
+  if (entry.live && entry.eventName === 'session/event') entry.listener(repoSession, event('turn/end', { turn: 1 }))
+}
+const offStill = await (await offRoutes.handleRevision(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))).json()
+check('and a change cannot move it', offStill.rev, 0)
+
+// 10j. a missing subsystem still answers 200 + rev 0: "I see nothing", not an error.
+const bareRoutes = createRoutes({ logger, get: () => undefined }, { allowedPaths: [repo], diagnostics: false })
+const bareBody = await (await bareRoutes.handleRevision(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))).json()
+check('no event service still answers ok with rev 0', [bareBody.ok, bareBody.rev, bareBody.enabled], [true, 0, true])
+bareRoutes.changes.revisionFor = () => {
+  throw new Error('table exploded')
+}
+const poisonedBody = await (await bareRoutes.handleRevision(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))).json()
+check('a throwing table degrades to rev 0, not a 500', [poisonedBody.ok, poisonedBody.rev], [true, 0])
+
+// 10k. `state` carries `rev`, sampled BEFORE the read.
+const stateRev = await (
+  await routes.handleState(new Request(`http://localhost${ROUTES.state}?sessionId=s1`))
+).json()
+checkThat('a state answer carries rev', typeof stateRev.rev === 'number', JSON.stringify(stateRev.rev))
+check('and the quiet fixture reports 0 there too', stateRev.rev, 0)
+// The sampling point is the contract: a change that lands DURING the read must
+// be left for the next poll, or the client would miss it entirely. `execFile`
+// is the seam that lets this suite land a change mid-read.
+const midReadDir = 'C:\\work\\MidRead'
+const midReadListeners = captureListeners()
+let firedDuringRead = false
+const midReadRoutes = createRoutes(
+  ctx,
+  { allowedPaths: [repo], diagnostics: false },
+  {
+    on: midReadListeners,
+    now: () => 1_700_000_000_000,
+    execFile(file, args, options, callback) {
+      if (!firedDuringRead) {
+        firedDuringRead = true
+        for (const entry of midReadListeners.listeners) {
+          if (entry.live && entry.eventName === 'session/event') {
+            entry.listener(sessionIn('s1', repo), event('turn/end', { turn: 1 }))
+          }
+        }
+      }
+      return fileRedirectExecFile(file, args, options, callback)
+    },
+  },
+)
+const during = await (await midReadRoutes.handleState(new Request(`http://localhost${ROUTES.state}?sessionId=s1`))).json()
+checkThat('a change during the read happened', firedDuringRead)
+checkThat('the answer carries the revision sampled before the read', during.rev === 0, JSON.stringify(during.rev))
+const afterRead = await (await midReadRoutes.handleRevision(new Request(`${revisionUrl}?sessionId=s1`))).json()
+checkThat('so the next poll sees it', afterRead.rev > during.rev, `${afterRead.rev} vs ${during.rev}`)
+void midReadDir
+
+// The `ok:false` branch carries rev too: a panel must be able to tell "still
+// failing, same revision" from "still failing, but the tree moved".
+const notRepoRoutes = createRoutes(ctx, { allowedPaths: [FIXTURE_OUTSIDE], diagnostics: false }, { execFile: fileRedirectExecFile })
+const notRepo = await (
+  await notRepoRoutes.handleState(new Request(`http://localhost${ROUTES.state}?dir=${encodeURIComponent(FIXTURE_OUTSIDE)}`))
+).json()
+check('an ok:false state answer carries rev as well', [notRepo.ok, typeof notRepo.rev], [false, 'number'])
+
+console.log('10l. the revision route is mounted, guarded by watchDiagnostics')
+const revisionMounted = []
+const revisionApplied = []
+const revisionMountCtx = {
+  logger,
+  get: ctx.get,
+  on: () => () => {},
+  effect(fn) {
+    const value = fn()
+    revisionApplied.push(typeof value === 'function' ? [value] : [...(value ?? [])])
+    return () => {}
+  },
+  connection: { fetch: { register: (route) => (revisionMounted.push(route), () => {}) } },
+}
+apply(revisionMountCtx, { allowedPaths: [repo], diagnostics: false }, { execFile: fileRedirectExecFile })
+const revisionRoute = revisionMounted.find((route) => route.path === ROUTES.revision)
+check('the revision route is mounted', {
+  path: revisionRoute?.path,
+  methods: revisionRoute?.methods,
+  requestBody: revisionRoute?.requestBody,
+}, { path: '/api/changelist.revision', methods: ['GET'], requestBody: 'buffered' })
+check('and the mount is five routes', revisionMounted.length, 5)
+check('the mount still owns every disposer', revisionApplied[0].length, 8)
+
+// The poll must stay out of the default activity log: 2-second polling would
+// bury the expensive reads the log exists to explain.
+const pollLog = path.join(FIXTURE_ROOT, 'diag', 'poll.log')
+fs.rmSync(pollLog, { force: true })
+const pollRegistered = []
+/** An effect that drains the generator, exactly like Cordis would. */
+const drainEffect = (fn) => {
+  const value = fn()
+  if (value && typeof value.next === 'function') for (let step = value.next(); !step.done; step = value.next()) void step.value
+  return () => {}
+}
+const pollCtx = {
+  logger,
+  get: ctx.get,
+  on: () => () => {},
+  effect: drainEffect,
+  connection: { fetch: { register: (route) => (pollRegistered.push(route), () => {}) } },
+}
+apply(pollCtx, { allowedPaths: [repo], diagnosticsPath: pollLog }, { execFile: fileRedirectExecFile })
+await pollRegistered.find((route) => route.path === ROUTES.revision).fetch(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))
+await new Promise((resolve) => setTimeout(resolve, 80))
+const polledLines = fs.existsSync(pollLog)
+  ? fs.readFileSync(pollLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  : []
+check(
+  'watchDiagnostics:false keeps polls out of the log',
+  polledLines.filter((entry) => entry.route === 'revision').length,
+  0,
+)
+checkThat('but the mount is still recorded', polledLines.some((entry) => entry.event === 'mounted'), JSON.stringify(polledLines.slice(0, 2)))
+// Opting in records them, with the counters a reader needs to interpret a poll.
+const verboseLog = path.join(FIXTURE_ROOT, 'diag', 'poll-verbose.log')
+fs.rmSync(verboseLog, { force: true })
+const verboseRegistered = []
+const verboseCtx = {
+  logger,
+  get: ctx.get,
+  on: () => () => {},
+  effect: drainEffect,
+  connection: { fetch: { register: (route) => (verboseRegistered.push(route), () => {}) } },
+}
+apply(verboseCtx, { allowedPaths: [repo], watchDiagnostics: true, diagnosticsPath: verboseLog })
+await verboseRegistered.find((route) => route.path === ROUTES.revision).fetch(new Request(`${revisionUrl}?dir=${encodeURIComponent(repo)}`))
+await new Promise((resolve) => setTimeout(resolve, 80))
+const verboseLines = fs.existsSync(verboseLog)
+  ? fs.readFileSync(verboseLog, 'utf8').trim().split('\n').map((line) => JSON.parse(line))
+  : []
+const verbosePoll = verboseLines.find((entry) => entry.route === 'revision')
+checkThat(
+  'watchDiagnostics:true records the poll with its counters',
+  verbosePoll !== undefined && typeof verbosePoll.rev === 'number' && verbosePoll.enabled === true,
+  JSON.stringify(verbosePoll),
+)
 
 console.log(`\n${checks - failures}/${checks} checks passed`)
 process.exit(failures === 0 ? 0 : 1)

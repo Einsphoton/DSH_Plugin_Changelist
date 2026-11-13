@@ -1,7 +1,7 @@
 /**
  * Host half of the workspace-changelist plugin.
  *
- * It answers four read-only routes for the browser half, registered inside the
+ * It answers five read-only routes for the browser half, registered inside the
  * Connection fetch fence so they inherit browser authentication and the
  * Host/Origin policy:
  *
@@ -9,12 +9,16 @@
  *   GET /api/changelist.state?dir=<abs>[&vcs=auto|git|p4][&base=<ref>][&fetch=1][&remote=origin]
  *   GET /api/changelist.diff?dir=<abs>&path=<repo-relative>[&vcs=auto|git|p4][&base=<ref>]
  *   GET /api/changelist.attention
+ *   GET /api/changelist.revision?sessionId=<id>|dir=<abs>
  *
  * The first three answer "what changed in this workspace". The fourth answers
  * "is any session, in any workspace, waiting for me" and takes no parameters at
  * all: its input is the Host's own `session/event` stream, folded by
- * {@link ./lib/attention.js}. It spawns nothing and writes nothing — it is a
- * cache over events the Host already produced.
+ * {@link ./lib/attention.js}. The fifth answers "has anything changed here since
+ * the revision you last saw" from the same event stream, folded by
+ * {@link ./lib/watch.js}: a browser polls it every couple of seconds and only
+ * pays for a real `state` read when the number moves. Both spawn nothing and
+ * write nothing — they are caches over events the Host already produced.
  *
  * Every directory is validated against the directories the Harness itself knows
  * (registered workspaces and live session working directories) before any
@@ -53,6 +57,7 @@ import {
 } from './lib/p4.js'
 import { createBackendRouter } from './lib/vcs.js'
 import { ATTENTION_SCHEMA_VERSION, createAttentionRegistry, emptyAttentionCounts } from './lib/attention.js'
+import { createChangeWatcher } from './lib/watch.js'
 
 export const name = 'changelist'
 
@@ -64,6 +69,7 @@ export const ROUTES = {
   state: '/api/changelist.state',
   diff: '/api/changelist.diff',
   attention: '/api/changelist.attention',
+  revision: '/api/changelist.revision',
 }
 
 export const DEFAULTS = {
@@ -125,6 +131,21 @@ export const DEFAULTS = {
   attentionMaxSessions: 50,
   /** Milliseconds a session keeps its state without new evidence (one day). */
   attentionRetentionMs: 86_400_000,
+  /**
+   * Publish `/api/changelist.revision`, the cheap "has this directory changed"
+   * poll. It is a cache over the Host's own `fs/observed` and `session/event`
+   * streams: no subprocess, no file write, no version-control command, so a
+   * browser may hit it every couple of seconds. `false` still answers the route
+   * (`{ok:true, enabled:false, rev:0}`) and subscribes to nothing, so a browser
+   * that polls unconditionally never sees an error.
+   */
+  watchEnabled: true,
+  /**
+   * Log every `revision` request in the activity log. Off by default: a two-
+   * second poll would turn `host.log` into noise within minutes. `state` reads
+   * are always logged; this only adds the cheap polls.
+   */
+  watchDiagnostics: false,
   /**
    * Append a bounded activity log next to the plugin (mount, unload, one line
    * per route request). This deployment exposes no Host log and the browser
@@ -447,6 +468,34 @@ export function createRoutes(ctx, config = {}, deps = {}) {
     },
   })
 
+  // ── Change detection ────────────────────────────────────────────────────
+  // The cheap half of the refresh story: a monotonic per-directory counter built
+  // from `fs/observed` and `session/event`, so a browser can ask "anything new?"
+  // every couple of seconds without paying for a `state` read (seven subprocesses,
+  // measured 0.45 s). Same lazy service story as attention: `deps.on` is the test
+  // seam, a missing event service leaves the counter at zero rather than failing
+  // the route, and `watchEnabled:false` subscribes to nothing at all.
+  const changes = createChangeWatcher({
+    on: settings.watchEnabled === false ? null : subscribe,
+    now: deps.now,
+  })
+
+  /**
+   * The change-detection revision for one directory.
+   *
+   * Deliberately total: a throwing clock or a poisoned table yields `rev: 0`
+   * ("I cannot see any change"), never an error a browser has to interpret.
+   */
+  function revisionAt(dir) {
+    if (settings.watchEnabled === false) return { rev: 0, at: 0 }
+    try {
+      const { rev, at } = changes.revisionFor(dir)
+      return { rev: Number.isFinite(rev) ? rev : 0, at: Number.isFinite(at) ? at : 0 }
+    } catch {
+      return { rev: 0, at: 0 }
+    }
+  }
+
   // ── Perforce plumbing ───────────────────────────────────────────────────
   // The executable is resolved once, lazily: a deployment with no Perforce
   // installed must not pay for (or fail on) the lookup.
@@ -616,12 +665,20 @@ export function createRoutes(ctx, config = {}, deps = {}) {
     if (authorized.error) return authorized.error
     const { dir } = authorized
 
+    // Sampled BEFORE the read starts, and reported with the answer. Anything the
+    // agent changes while git/p4 is running must be left for the next poll: if
+    // this answer carried the *post-read* revision, a change that landed during
+    // the read would be silently absorbed and the panel would sit one revision
+    // behind until something else happened.
+    const rev = revisionAt(dir).rev
+
     const backend = await resolveBackend(query, dir)
-    if (backend.vcs === 'p4') return handleP4State(query, dir, authorized.target, backend)
-    if (backend.vcs === 'git') return handleGitState(query, dir, authorized.target, backend)
+    if (backend.vcs === 'p4') return handleP4State(query, dir, authorized.target, backend, rev)
+    if (backend.vcs === 'git') return handleGitState(query, dir, authorized.target, backend, rev)
 
     return json({
       ok: false,
+      rev,
       vcs: null,
       dir,
       reason: backend.reason ?? 'not-a-repository',
@@ -633,7 +690,7 @@ export function createRoutes(ctx, config = {}, deps = {}) {
   }
 
   /** Build the git answer plus the shared backend metadata. */
-  async function handleGitState(query, dir, target, backend) {
+  async function handleGitState(query, dir, target, backend, rev) {
     let fetch = null
     if (query.get('fetch') === '1') {
       const remote = query.get('remote') || 'origin'
@@ -648,6 +705,7 @@ export function createRoutes(ctx, config = {}, deps = {}) {
       ...state,
       vcs: state.vcs ?? 'git',
       notes,
+      rev,
       baseKind: resolved.kind,
       remote: resolved.remote,
       fetch,
@@ -659,7 +717,7 @@ export function createRoutes(ctx, config = {}, deps = {}) {
   }
 
   /** Build the Perforce answer, including the connection summary the panel shows. */
-  async function handleP4State(query, dir, target, backend) {
+  async function handleP4State(query, dir, target, backend, rev) {
     const known = discoveredP4()
     // What the panel pre-fills: an explicit request, then plugin config, then what
     // P4V itself is already logged in with. The panel renders these inside the
@@ -676,6 +734,7 @@ export function createRoutes(ctx, config = {}, deps = {}) {
     if (!p4run) {
       return json({
         ok: false,
+        rev,
         vcs: 'p4',
         dir,
         reason: 'p4-unavailable',
@@ -726,6 +785,7 @@ export function createRoutes(ctx, config = {}, deps = {}) {
       ...state,
       vcs: state.vcs ?? 'p4',
       notes,
+      rev,
       options: { ...(state.options ?? {}), discovered },
       baseKind: state.baseKind ?? null,
       remote: null,
@@ -837,6 +897,29 @@ export function createRoutes(ctx, config = {}, deps = {}) {
     })
   }
 
+  /**
+   * The cheap change check behind the chip's poll.
+   *
+   * It resolves the target exactly like `state` does (same `sessionId`/`dir`
+   * rules, same 404/403/400 refusals, same body shape) and then answers from
+   * memory only: no subprocess, no file read, no write. A browser polls this
+   * every couple of seconds and only calls `state` when `rev` moves.
+   *
+   * It cannot fail for a missing subsystem. No session service, no event
+   * subscription, or an observation-disabled configuration all yield
+   * `{ok:true, rev:0}`: that is "I cannot see any change", which is exactly what
+   * the caller needs to know, and never an error surface a panel would have to
+   * render.
+   */
+  async function handleRevision(request) {
+    const query = new URL(request.url).searchParams
+    const authorized = resolveTarget(query)
+    if (authorized.error) return authorized.error
+    const { dir } = authorized
+    const { rev, at } = revisionAt(dir)
+    return json({ ok: true, dir, rev, at, enabled: settings.watchEnabled !== false })
+  }
+
   return {
     settings,
     limits,
@@ -846,10 +929,12 @@ export function createRoutes(ctx, config = {}, deps = {}) {
     router,
     p4Executable,
     attention,
+    changes,
     handleTargets,
     handleState,
     handleDiff,
     handleAttention,
+    handleRevision,
   }
 }
 
@@ -880,6 +965,16 @@ export function apply(ctx, config = {}, deps = {}) {
       /* a broken log is not a broken route */
     }
   }
+
+  /**
+   * Whether one route hit belongs in the activity log.
+   *
+   * `state` and friends are worth a line each: they are the expensive reads. The
+   * `revision` poll is not — the whole point of it is to run every couple of
+   * seconds, and logging it by default would turn `host.log` into noise that
+   * buries the reads it exists to explain. `watchDiagnostics` opts in.
+   */
+  const logsRoute = (routeName) => routeName !== 'revision' || routes.settings.watchDiagnostics === true
 
   /** Wrap one route so every answer (and every failure) lands in the activity log. */
   const guard = (name, handler) => async (request) => {
@@ -921,6 +1016,11 @@ export function apply(ctx, config = {}, deps = {}) {
             gitDetail: body.detail ?? undefined,
             targets: Array.isArray(body.targets) ? body.targets.length : undefined,
             dirs: Array.isArray(body.targets) ? body.targets.slice(0, 6).map((entry) => entry.dir) : undefined,
+            // The change-detection counters, so a poll line can be read without a
+            // second request: `rev` is what the client compares, `enabled` says
+            // whether observation is on at all.
+            rev: typeof body.rev === 'number' ? body.rev : undefined,
+            enabled: typeof body.enabled === 'boolean' ? body.enabled : undefined,
             // The directory the answer is actually about. A `sessionId` request
             // carries no `dir` in the URL, so without body.dir a switch between
             // projects is indistinguishable in the log — which is exactly the
@@ -930,20 +1030,22 @@ export function apply(ctx, config = {}, deps = {}) {
         } catch {
           detail = {}
         }
-        log({
-          event: 'route',
-          route: name,
-          status: response.status,
-          ms: Date.now() - started,
-          sessionId: query?.get('sessionId') ?? undefined,
-          dir: query?.get('dir') ?? undefined,
-          ...detail,
-        })
+        if (logsRoute(name)) {
+          log({
+            event: 'route',
+            route: name,
+            status: response.status,
+            ms: Date.now() - started,
+            sessionId: query?.get('sessionId') ?? undefined,
+            dir: query?.get('dir') ?? undefined,
+            ...detail,
+          })
+        }
         return { body: bodyText, status: response.status, headers: response.headers }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         ctx.logger?.warn?.('changelist: route failed: %s', message)
-        log({ event: 'route', route: name, status: 500, ms: Date.now() - started, error: message })
+        if (logsRoute(name)) log({ event: 'route', route: name, status: 500, ms: Date.now() - started, error: message })
         const fallback = json({ ok: false, message }, 500)
         return { body: await fallback.text(), status: 500, headers: fallback.headers }
       }
@@ -987,9 +1089,18 @@ export function apply(ctx, config = {}, deps = {}) {
       requestBody: 'buffered',
       fetch: guard('attention', routes.handleAttention),
     })
+    yield ctx.connection.fetch.register({
+      path: ROUTES.revision,
+      methods: ['GET'],
+      requestBody: 'buffered',
+      fetch: guard('revision', routes.handleRevision),
+    })
     // The attention registry owns a `session/event` subscription; the effect must
     // own its disposer too, or a plugin unload would leave the listener behind.
     yield routes.attention.dispose
+    // The change watcher owns BOTH an `fs/observed` and a `session/event`
+    // subscription, so its disposer has to be effect-owned for the same reason.
+    yield routes.changes.dispose
     ctx.logger?.info?.('changelist: registered %s', Object.values(ROUTES).join(', '))
   }, 'changelist: fetch routes')
 }

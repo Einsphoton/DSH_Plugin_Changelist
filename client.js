@@ -968,6 +968,51 @@ window.__ModuleLoader__.load({
       return run
     }
 
+    // ── automatic refresh: a cheap revision poll drives the expensive read ──
+    //
+    // A `state` read spawns seven git commands (~0.45 s, P95 1.9 s), so polling it
+    // would keep the fan running. `revision` only reads an in-memory counter and
+    // spawns nothing, so the browser asks it on a timer and pays for a `state`
+    // read only when the number actually moved. That is the whole freshness
+    // story: without it the chip kept yesterday's count until someone clicked
+    // 刷新, because `loadState` only ever ran on a click.
+    //
+    // One watcher for the module, not one per surface: a second chip on screen
+    // must not double the request rate. `users` counts mounts; the last release
+    // stops the timer and detaches the listeners.
+    const watchTuning = {
+      pollVisibleMs: 2000,
+      pollHiddenMs: 8000,
+      /** Minimum gap between two automatic reads: bursts collapse into one. */
+      minAutoMs: 1200,
+    }
+    /**
+     * The rev each target's own last read reflects, keyed by `targetKey`.
+     *
+     * Per target, never one global value: A at rev 37 then B at rev 5 would look
+     * like a backward jump and stop the refresh. Unknown means "no baseline yet"
+     * — the read that selected the target has already loaded it.
+     */
+    const appliedRevByTarget = new Map()
+    const watchState = {
+      users: 0,
+      timer: null,
+      /** The delay the live timer was armed with: lets a test see the cadence. */
+      pendingDelay: null,
+      /** The single in-flight `revision` request, shared by every caller. */
+      inFlight: null,
+      /** True while an automatic `state` read runs, so two never overlap. */
+      inFlightState: false,
+      /** Targets whose auto refresh gave up on a 404 / network error. */
+      disabled: new Set(),
+      attached: false,
+      detach: [],
+      /** The translator of the most recent mount, for silent reads. */
+      t: null,
+      /** Timestamp of the last automatic read, for `minAutoMs`. */
+      lastAutoReadAt: 0,
+    }
+
     // A state read for one target can be triggered by several mounted chips and
     // by a refresh in the same tick; share the in-flight promise so the Host is
     // not asked for the same list four times (it used to spawn ~40 processes).
@@ -992,7 +1037,7 @@ window.__ModuleLoader__.load({
       // refresh, a fetch, a target switch): it would bump `generation` and throw
       // that answer away. Skipping one tick costs nothing — the next poll picks
       // the change up again because the rev is only marked applied once read.
-      if (auto && stateInFlight) return null
+      if (auto && stateInFlight && !options.force) return null
       const token = ++generation
       // A state read replaces the list, so any comparison still in flight would
       // be answering about a list that no longer exists.
@@ -1042,6 +1087,21 @@ window.__ModuleLoader__.load({
           })
           loaded = true
           result = body
+          // The answer carries the rev it reflects (contract §2), so the panel's
+          // baseline is known without a second request.
+          //
+          // A foreground read may adopt it outright: the reader has just seen
+          // this exact list, so any change the Host counted before answering is
+          // already on screen. A background read must NOT — it recorded the rev
+          // it was polled with, and a larger one here is a change that landed
+          // mid-read and belongs to the next poll, not to this read.
+          if (typeof body.rev === 'number' && snapshot.target) {
+            const key = targetKey(snapshot.target)
+            // Foreground: adopt outright — this list is what the reader sees.
+            // Background: only seed a target with no baseline; a larger rev here
+            // is a change that landed mid-read and must survive to the next poll.
+            if (!auto || !appliedRevByTarget.has(key)) appliedRevByTarget.set(key, body.rev)
+          }
         } catch (cause) {
           if (token !== generation) return
           // A silent refresh has no surface to report on: the previous list is
@@ -1164,6 +1224,243 @@ window.__ModuleLoader__.load({
       })
       if (target.kind !== 'session' && target.dir) remember(target.dir)
       return loadState({ ...options, t })
+    }
+
+    // ── the revision watcher (contract §5) ────────────────────────────────
+    const REVISION_BASE = `${BASE}.revision`
+
+    /** Is the tab currently visible? A missing `visibilityState` counts as visible. */
+    function watchHidden() {
+      try {
+        return typeof document !== 'undefined' && document.visibilityState === 'hidden'
+      } catch {
+        return false
+      }
+    }
+
+    /**
+     * The `revision` query for the current target: exactly the `state` targeting
+     * parameters and **no `vcs`**.
+     *
+     * `vcs` chooses which backend answers; it cannot change whether a directory
+     * moved. Sending it would also make the poll URL change on every backend
+     * switch, needlessly splitting the in-flight coalescing.
+     */
+    function revisionQuery(snapshot) {
+      const query = targetQuery(snapshot)
+      if (!query) return null
+      return new URLSearchParams(query).toString()
+    }
+
+    /** Forget one target's baseline, e.g. after its directory changed. */
+    function forgetRev(target) {
+      if (!target) return
+      appliedRevByTarget.delete(targetKey(target))
+    }
+
+    /**
+     * Ask the Host whether the current target moved. One request in flight
+     * module-wide, whatever the number of mounted surfaces.
+     *
+     * A 404 (a Host half from before this route) or a network error disables
+     * auto refresh for that target and nothing else: the reader keeps their own
+     * 刷新 button, and — this is the point — sees no error surface at all. A
+     * missing enhancement must never look like a broken feature.
+     */
+    async function loadRevision(options = {}) {
+      const snapshot = store.get()
+      const query = revisionQuery(snapshot)
+      const target = snapshot.target
+      if (!query || !target) return null
+      const key = targetKey(target)
+      if (watchState.disabled.has(key)) return null
+      if (watchState.inFlight) return watchState.inFlight
+      const run = (async () => {
+        try {
+          const body = await requestJson(`${REVISION_BASE}?${query}`)
+          return body
+        } catch (cause) {
+          // 404 = older Host half. Anything else = the route is unreachable.
+          // Both mean "this enhancement cannot work here", not "the workspace
+          // failed"; record it per target and stay quiet.
+          watchState.disabled.add(key)
+          return null
+        } finally {
+          watchState.inFlight = null
+        }
+      })()
+      watchState.inFlight = run
+      return run
+    }
+
+    /**
+     * Record the rev a read reflects and, when it differs from what the panel
+     * already shows, run one silent `state` read.
+     *
+     * The **polled** rev is recorded, not one re-read afterwards: a change that
+     * lands during the read must be left for the next poll instead of being
+     * swallowed, which is what makes the second edit of a turn show up too.
+     *
+     * Only `!==` is ever compared. The Host's counter is an in-process sequence,
+     * so it restarts on a plugin reload or a Host restart; a lower number is a
+     * different number, not a rollback, and must still trigger a read.
+     */
+    function applyRev(target, rev, options = {}) {
+      const key = targetKey(target)
+      const seen = typeof rev === 'number' && Number.isFinite(rev) ? rev : 0
+      const previous = appliedRevByTarget.get(key)
+      // No baseline yet: the read that selected this target has just loaded it,
+      // so adopt the number instead of asking for the same list twice.
+      if (previous === undefined) {
+        appliedRevByTarget.set(key, seen)
+        return false
+      }
+      if (previous === seen) return false
+      // Throttled or already reading: leave the baseline untouched, so the next
+      // poll sees the same difference again and retries it. Marking it applied
+      // here would silently drop the change.
+      if (!autoReadReady()) return false
+      appliedRevByTarget.set(key, seen)
+      void runAutoRead(options.t)
+      return true
+    }
+
+    /** May another automatic read start right now? */
+    function autoReadReady() {
+      if (watchState.inFlightState) return false
+      return Date.now() - watchState.lastAutoReadAt >= watchTuning.minAutoMs
+    }
+
+    /** One silent state read. The caller has already claimed the throttle slot. */
+    async function runAutoRead(t) {
+      watchState.lastAutoReadAt = Date.now()
+      watchState.inFlightState = true
+      try {
+        return await loadState({ auto: true, t: t ?? watchState.t })
+      } finally {
+        watchState.inFlightState = false
+      }
+    }
+
+    /** One poll: check the rev, and do the visibility compensation when asked. */
+    async function watchTick(options = {}) {
+      const snapshot = store.get()
+      const target = snapshot.target
+      if (!target) return null
+      if (watchState.disabled.has(targetKey(target))) return null
+      const body = await loadRevision()
+      if (!body || typeof body !== 'object') return null
+      // The target may have moved while the request was in flight.
+      if (targetKey(store.get().target ?? {}) !== targetKey(target)) return null
+      const rev = typeof body.rev === 'number' ? body.rev : 0
+      const changed = applyRev(target, rev, options)
+      // Returning to the tab: the only compensation for edits the Host never
+      // saw. External editors and `git checkout` never bump the revision, so a
+      // rev check alone would keep reporting the numbers from before.
+      if (options.compensate && !changed) {
+        const openNow = store.get().open
+        if (openNow && autoReadReady()) await runAutoRead(options.t)
+      }
+      return rev
+    }
+
+    /** Arm the next tick at the cadence the current visibility deserves. */
+    function watchArm() {
+      if (watchState.users <= 0) return
+      if (typeof setTimeout !== 'function') return
+      const delay = watchHidden() ? watchTuning.pollHiddenMs : watchTuning.pollVisibleMs
+      watchState.pendingDelay = delay
+      watchState.timer = setTimeout(async () => {
+        watchState.timer = null
+        watchState.pendingDelay = null
+        await watchTick({ t: watchState.t })
+        watchArm()
+      }, delay)
+    }
+
+    /**
+     * Attach the listeners that make the panel honest again.
+     *
+     * `visibilitychange` and `focus` exist only in a real browser; in the test
+     * shim they are absent, so their handlers are reachable through the test
+     * seam instead of being unreachable code.
+     */
+    function watchAttach() {
+      if (watchState.attached) return
+      watchState.attached = true
+      const onVisible = () => {
+        if (watchHidden()) return
+        // Immediately, not on the tick: coming back is exactly when a stale
+        // number is most misleading.
+        void watchTick({ compensate: true, t: watchState.t })
+      }
+      const onFocus = () => {
+        if (watchHidden()) return
+        void watchTick({ compensate: true, t: watchState.t })
+      }
+      watchState.onVisible = onVisible
+      watchState.onFocus = onFocus
+      try {
+        if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+          document.addEventListener('visibilitychange', onVisible)
+          watchState.detach.push(() => document.removeEventListener('visibilitychange', onVisible))
+        }
+        if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+          window.addEventListener('focus', onFocus)
+          watchState.detach.push(() => window.removeEventListener('focus', onFocus))
+        }
+      } catch {
+        /* a host without DOM events simply never gets the compensation */
+      }
+    }
+
+    function watchDetach() {
+      watchState.attached = false
+      for (const off of watchState.detach) {
+        try {
+          off()
+        } catch {
+          /* a listener removed twice is not an error worth reporting */
+        }
+      }
+      watchState.detach = []
+    }
+
+    /**
+     * A surface mounted: start the shared watcher if it is the first one.
+     * Returns the release function; the last release stops everything, so
+     * unmounting leaves no timer behind.
+     */
+    function watchMount(t) {
+      if (typeof t === 'function') watchState.t = t
+      watchState.users += 1
+      watchAttach()
+      if (watchState.users === 1) watchArm()
+      let released = false
+      return () => {
+        if (released) return
+        released = true
+        watchState.users = Math.max(0, watchState.users - 1)
+        if (watchState.users > 0) return
+        if (watchState.timer) clearTimeout(watchState.timer)
+        watchState.timer = null
+        watchState.pendingDelay = null
+        watchDetach()
+      }
+    }
+
+    /** Test seam: restore the watcher to its just-loaded state between sections. */
+    function watchReset() {
+      if (watchState.timer) clearTimeout(watchState.timer)
+      watchState.timer = null
+      watchState.pendingDelay = null
+      watchState.users = 0
+      watchState.inFlight = null
+      watchState.inFlightState = false
+      watchState.lastAutoReadAt = 0
+      appliedRevByTarget.clear()
+      watchState.disabled.clear()
+      watchDetach()
     }
 
     /**
@@ -1512,6 +1809,19 @@ window.__ModuleLoader__.load({
      * Drop stale `done` reminders so the pill does not keep a green dot forever.
      * `waiting`/`error` are kept: a blocked or failed session is still true
      * regardless of the clock.
+     */
+    /**
+     * Drop `done` reminders that have gone stale, and drop anything the Host
+     * flagged as a delegated child.
+     *
+     * The second half is deliberate duplication of a Host-side rule. A subagent
+     * child inherits its parent's cwd, so it is indistinguishable from a real
+     * project by directory alone; it also can never be selected in the client,
+     * which makes its row a dead end. The Host filters these, but a row leaking
+     * through (an older Host half, a record seeded before the filter existed)
+     * would put unopenable rows back in front of the reader, so the browser
+     * refuses them too. Defence in depth on a surface whose whole value is that
+     * its rows are actionable.
      */
     function isDelegatedChild(session) {
       return (
@@ -2721,6 +3031,11 @@ window.__ModuleLoader__.load({
           await selectTarget(target, t)
         }
         void apply(sessionId)
+        // Automatic refresh rides on this surface being mounted: it is the one
+        // that is always on screen, and the watcher is shared module-wide, so a
+        // second chip adds a reference instead of a second timer. The release is
+        // the effect's cleanup — unmounting leaves no timer behind.
+        const releaseWatch = watchMount(t)
         // Follow the session once it becomes known, and across session switches.
         const unsubscribe =
           typeof props.subscribeViewedSession === 'function'
@@ -2732,6 +3047,7 @@ window.__ModuleLoader__.load({
             : undefined
         return () => {
           cancelled = true
+          releaseWatch()
           if (typeof unsubscribe === 'function') unsubscribe()
         }
       }, [])
@@ -2803,6 +3119,37 @@ window.__ModuleLoader__.load({
        * plugin reads this object except the defaults it was born with.
        */
       attentionInternals: { tuning: attentionTuning, store: attention, load: loadAttention, summary: attentionSummary },
+      /**
+       * Test seam, not API. Same reasoning as `attentionInternals`: the poll
+       * cadence and the throttle are wall-clock timings, and the timer is a
+       * module-level singleton, so the suite needs a handle to drive one tick,
+       * read the armed delay, fire a visibility change and observe the unmount.
+       * Production never touches it.
+       */
+      changeInternals: {
+        tuning: watchTuning,
+        /**
+         * The cadence as loaded. `tuning` is mutable so the suite can drive the
+         * clock; this snapshot is what the shipped defaults actually are, taken
+         * before anything can change them.
+         */
+        productionTuning: { ...watchTuning },
+        store,
+        watcher: watchState,
+        applied: appliedRevByTarget,
+        tick: watchTick,
+        mount: watchMount,
+        reset: watchReset,
+        revision: loadRevision,
+        /** The handlers the DOM listeners would call, for a shim without events. */
+        visibility: (options = {}) => watchTick({ compensate: true, ...options }),
+        /** The delay the armed timer was scheduled with (`null` when idle). */
+        armedDelay: () => watchState.pendingDelay,
+        /** Mount count: proves a second surface joins instead of adding a timer. */
+        users: () => watchState.users,
+        /** Forget a target's baseline, as a directory change would. */
+        forget: forgetRev,
+      },
       apply(ctx) {
         if (typeof ctx.locale?.register === 'function') {
           ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'changelist: dictionaries')
